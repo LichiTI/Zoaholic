@@ -95,7 +95,9 @@ export default function Plugins() {
     const q = search.trim().toLowerCase();
     if (!q) return plugins;
     return plugins.filter(p => {
-      const hay = `${p.name} ${p.version || ''} ${p.description || ''} ${p.author || ''} ${p.source || ''}`.toLowerCase();
+      const metaTags = Array.isArray(p.metadata?.tags) ? p.metadata.tags.join(' ') : '';
+      const metaCat = p.metadata?.category || '';
+      const hay = `${p.name} ${p.version || ''} ${p.description || ''} ${p.author || ''} ${p.source || ''} ${metaTags} ${metaCat}`.toLowerCase();
       return hay.includes(q);
     });
   }, [plugins, search]);
@@ -285,6 +287,10 @@ export default function Plugins() {
         ) : (
           filtered.map((p) => {
             const hasError = !!p.error;
+            const category = p.metadata?.category;
+            const tags: string[] = Array.isArray(p.metadata?.tags) ? p.metadata.tags : [];
+            const paramsHint: string | undefined = p.metadata?.params_hint;
+            const extensions: string[] = Array.isArray(p.extensions) ? p.extensions : [];
             return (
               <div key={p.name} className="bg-card border border-border rounded-xl overflow-hidden">
                 <div className="p-4 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
@@ -308,6 +314,11 @@ export default function Plugins() {
                           {p.source}
                         </span>
                       )}
+                      {category && (
+                        <span className="text-xs bg-violet-500/10 text-violet-600 dark:text-violet-400 px-2 py-0.5 rounded">
+                          {category}
+                        </span>
+                      )}
                       {hasError && (
                         <span className="text-xs bg-destructive/10 text-destructive px-2 py-0.5 rounded flex items-center gap-1">
                           <AlertTriangle className="w-3.5 h-3.5" /> 加载失败
@@ -317,11 +328,40 @@ export default function Plugins() {
 
                     {p.description && <div className="text-sm text-muted-foreground mt-1 break-words">{p.description}</div>}
 
+                    {/* Tags */}
+                    {tags.length > 0 && (
+                      <div className="flex flex-wrap gap-1 mt-1.5">
+                        {tags.map((tag) => (
+                          <span key={tag} className="text-[10px] bg-muted text-muted-foreground px-1.5 py-0.5 rounded">
+                            {tag}
+                          </span>
+                        ))}
+                      </div>
+                    )}
+
+                    {/* Params Hint */}
+                    {paramsHint && (
+                      <div className="mt-2 bg-muted/50 border border-border rounded-lg px-3 py-2">
+                        <div className="text-[10px] font-medium text-muted-foreground mb-1">参数说明</div>
+                        <pre className="text-xs text-foreground/80 whitespace-pre-wrap font-mono leading-relaxed">{paramsHint}</pre>
+                      </div>
+                    )}
+
                     <div className="text-xs text-muted-foreground mt-2 space-y-0.5">
                       {p.author && (
                         <div>
                           <span className="font-medium">作者：</span>
                           {p.author}
+                        </div>
+                      )}
+                      {extensions.length > 0 && (
+                        <div>
+                          <span className="font-medium">扩展点：</span>
+                          {extensions.map((ext, i) => (
+                            <span key={i} className="font-mono ml-1 bg-muted px-1 py-0.5 rounded text-[10px]">
+                              {ext}
+                            </span>
+                          ))}
                         </div>
                       )}
                       {p.path && (
