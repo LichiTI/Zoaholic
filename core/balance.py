@@ -40,12 +40,22 @@ BALANCE_TEMPLATES: Dict[str, Dict[str, Any]] = {
         },
     },
     "openrouter": {
-        "endpoint": "https://openrouter.ai/api/v1/key",
+        "endpoint": "https://openrouter.ai/api/v1/credits",
         "method": "GET",
         "auth": "bearer",
         "mapping": {
-            "total": "data.limit",
-            "used": "data.usage",
+            "total": "data.total_credits",
+            "used": "data.total_usage",
+            "value_type": "'amount'",
+        },
+    },
+    "deepseek": {
+        "endpoint": "https://api.deepseek.com/user/balance",
+        "method": "GET",
+        "auth": "bearer",
+        "mapping": {
+            "available": "balance_infos.0.total_balance",
+            "currency": "balance_infos.0.currency",
             "value_type": "'amount'",
         },
     },

@@ -115,6 +115,9 @@ class LogEntry(BaseModel):
     prompt_tokens: Optional[int] = None
     completion_tokens: Optional[int] = None
     total_tokens: Optional[int] = None
+    # Prompt Caching 统计随日志返回给前端，用于列表摘要和展开详情展示。
+    cached_tokens: Optional[int] = None
+    cache_creation_tokens: Optional[int] = None
     success: bool = False
     status_code: Optional[int] = None
     prompt_price: Optional[float] = None
@@ -1412,6 +1415,9 @@ async def get_logs(
                     prompt_tokens=int(row.get("prompt_tokens") or 0),
                     completion_tokens=int(row.get("completion_tokens") or 0),
                     total_tokens=int(row.get("total_tokens") or 0),
+                    # D1 旧表可能尚无缓存列，使用 get 默认 0 保持兼容。
+                    cached_tokens=int(row.get("cached_tokens") or 0),
+                    cache_creation_tokens=int(row.get("cache_creation_tokens") or 0),
                     success=_bool_from_db(row.get("success")),
                     status_code=int(row.get("status_code")) if row.get("status_code") is not None else None,
                     prompt_price=float(row.get("prompt_price")) if row.get("prompt_price") is not None else None,
@@ -1551,6 +1557,9 @@ async def get_logs(
                 prompt_tokens=row.prompt_tokens,
                 completion_tokens=row.completion_tokens,
                 total_tokens=row.total_tokens,
+                # SQLAlchemy 分支直接读取 ORM 字段，旧数据为空时前端按 0 展示。
+                cached_tokens=getattr(row, 'cached_tokens', 0) or 0,
+                cache_creation_tokens=getattr(row, 'cache_creation_tokens', 0) or 0,
                 success=row.success if hasattr(row, 'success') else False,
                 status_code=row.status_code if hasattr(row, 'status_code') else None,
                 prompt_price=getattr(row, 'prompt_price', None),
@@ -1649,3 +1658,92 @@ async def get_outbound_logs(
         search=search,
     )
     return JSONResponse(content=result)
+
+
+# ── 内存级 provider 活跃度缓存 ──
+import time as _time
+_provider_last_seen: dict[str, float] = {}  # provider → unix timestamp
+_activity_warmed = False
+
+def record_provider_activity(provider: str):
+    """每次请求经过时调用，O(1) 写入内存"""
+    if provider:
+        _provider_last_seen[provider] = _time.time()
+
+async def warm_provider_activity():
+    """启动时从 DB 预热缓存（后台执行，不阻塞启动）"""
+    global _activity_warmed
+    try:
+        from db import DISABLE_DATABASE, DB_TYPE
+        if DISABLE_DATABASE:
+            _activity_warmed = True
+            return
+        if (DB_TYPE or "sqlite").lower() == "d1":
+            _activity_warmed = True
+            return
+        from db import async_session_scope, RequestStat
+        from sqlalchemy import func, select
+        async with async_session_scope() as session:
+            stmt = select(
+                RequestStat.provider,
+                func.max(RequestStat.timestamp).label("last_active")
+            ).group_by(RequestStat.provider)
+            result = await session.execute(stmt)
+            for row in result.fetchall():
+                provider = row[0]
+                last_active = row[1]
+                if provider and last_active:
+                    ts = last_active.timestamp() if hasattr(last_active, 'timestamp') else _time.time()
+                    # 只填充还没有的（运行时记录优先）
+                    if provider not in _provider_last_seen:
+                        _provider_last_seen[provider] = ts
+        _activity_warmed = True
+        import logging
+        logging.getLogger(__name__).info(f"[provider_activity] Warmed cache from DB: {len(_provider_last_seen)} providers")
+    except Exception as e:
+        _activity_warmed = True
+        import logging
+        logging.getLogger(__name__).warning(f"[provider_activity] Warm failed: {e}")
+
+# 每日活跃度刷新已移至 main.py 统一 daily_maintenance 循环
+
+@router.get("/v1/stats/provider_activity", dependencies=[Depends(rate_limit_dependency)])
+async def provider_activity():
+    """
+    返回每个 provider 的最后活跃时间（从内存缓存读取，秒回）。
+    Returns: {"activity": {"provider_name": 1714567890.123, ...}, "warmed": true}
+    """
+    return JSONResponse(content={"activity": _provider_last_seen, "warmed": _activity_warmed})
+
+
+@router.post("/v1/stats/resolve_prices", dependencies=[Depends(rate_limit_dependency)])
+async def resolve_prices(request: Request):
+    """
+    批量查询模型价格。走完整 6 层级联（渠道 > 全局 > 外部库 > default > 0）。
+    
+    Body: {"models": [{"model": "gpt-4o", "provider": "openai"}, ...]}
+    Returns: {"prices": {"gpt-4o": {"prompt": 2.5, "completion": 10.0}, ...}}
+    """
+    from core.stats import get_current_model_prices
+    app = get_app()
+    body = await request.json()
+    models = body.get("models", [])
+    
+    prices = {}
+    for item in models:
+        if isinstance(item, str):
+            model_name = item
+            provider_name = None
+        elif isinstance(item, dict):
+            model_name = item.get("model", "")
+            provider_name = item.get("provider")
+        else:
+            continue
+        if not model_name or model_name in prices:
+            continue
+        prompt_price, completion_price = get_current_model_prices(
+            app, model_name, provider_name=provider_name
+        )
+        prices[model_name] = {"prompt": prompt_price, "completion": completion_price}
+    
+    return JSONResponse(content={"prices": prices})
