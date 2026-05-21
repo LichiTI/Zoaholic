@@ -48,6 +48,10 @@ const LOG_CLEANUP_FIELD_OPTIONS: { key: string; label: string }[] = [
   { key: 'request_body', label: '用户请求体' },
   { key: 'upstream_request_headers', label: '上游请求头' },
   { key: 'upstream_request_body', label: '上游请求体' },
+  // 修改原因：日志清理界面需要能选择新增的上游响应头字段。
+  // 修改方式：在上游请求体之后加入 upstream_response_headers 选项。
+  // 目的：保持前端清理选项与后端 LOG_CLEARABLE_FIELDS 一致。
+  { key: 'upstream_response_headers', label: '上游响应头' },
   { key: 'upstream_response_body', label: '上游响应体' },
   { key: 'response_body', label: '返回给用户的响应体' },
   { key: 'retry_path', label: '重试路径' },
@@ -337,16 +341,7 @@ export default function Settings() {
           </div>
           <div className="p-6 space-y-6">
             <div className="grid grid-cols-2 gap-6">
-              <div>
-                <label className="text-sm font-medium text-foreground mb-1.5 block">最大重试次数</label>
-                <input
-                  type="number" min="1" max="100"
-                  value={preferences.max_retry_count ?? 10}
-                  onChange={e => updatePreference('max_retry_count', parseInt(e.target.value))}
-                  className="w-full bg-background border border-border px-3 py-2 rounded-lg text-sm text-foreground"
-                />
-                <p className="text-xs text-muted-foreground mt-1">多渠道场景下的最大重试次数上限（1-100）</p>
-              </div>
+              {/* max_retry_count 已废弃 — 重试终止靠 key_rules 冷却 + is_all_rate_limited 兜底 */}
               <div>
                 <label className="text-sm font-medium text-foreground mb-1.5 block">渠道冷却时间 (秒)</label>
                 <input

@@ -1,5 +1,6 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
-import { useEffect, useMemo, useRef, useState, KeyboardEvent, ClipboardEvent, DragEvent } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, KeyboardEvent, ClipboardEvent, DragEvent } from 'react';
+import { createPortal } from 'react-dom';
 import { useAuthStore } from '../store/authStore';
 import { apiFetch } from '../lib/api';
 import { toastSuccess, toastError, toastWarning, fmtErr } from '../components/Toast';
@@ -7,7 +8,8 @@ import {
   Plus, Edit, Brain, Trash2, ArrowRight, RefreshCw,
   Server, X, CheckCircle2, Settings2, Copy, ToggleRight, ToggleLeft,
   Folder, Puzzle, Network, CopyCheck, Power, Files, Play,
-  Search, Check, BarChart3, Wallet, XCircle, Link2, GripVertical
+  Search, Check, BarChart3, Wallet, XCircle, Link2, GripVertical, ChevronUp, ChevronDown,
+  ClipboardPaste, LogIn, Download
 } from 'lucide-react';
 import * as Dialog from '@radix-ui/react-dialog';
 import * as Switch from '@radix-ui/react-switch';
@@ -25,11 +27,123 @@ import {
   getProviderWeight,
   summarizeVirtualChain,
 } from '../lib/virtualModels';
+import {
+  formatKeyRuleKeywordsInput,
+  formatKeyRuleStatusInput,
+  getKeyRuleRetryMode,
+  parseKeyRuleKeywordsInput,
+  parseKeyRuleStatusInput,
+  sanitizeKeyRulesForSave,
+  setKeyRuleRetryMode,
+  type KeyRuleRetryMode,
+} from '../lib/keyRules';
+
+// ========== DeferredInput ==========
+// 本地 state 暂存输入，blur/Enter 时才写回外部，避免 parse+trim 吞空格
+function DeferredInput({ value, onCommit, ...props }: Omit<React.InputHTMLAttributes<HTMLInputElement>, 'onChange' | 'onBlur' | 'onKeyDown' | 'value'> & { value: string; onCommit: (v: string) => void }) {
+  const [local, setLocal] = useState(value);
+  const ref = useRef<HTMLInputElement>(null);
+  useEffect(() => { if (ref.current !== document.activeElement) setLocal(value); }, [value]);
+  return <input ref={ref} {...props} type="text" value={local} onChange={e => setLocal(e.target.value)} onBlur={() => onCommit(local)} onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); onCommit(local); (e.target as HTMLInputElement).blur(); } }} />;
+}
+
+// 修改原因：Key 备注遮罩原先使用固定 30% 宽度，短备注会浪费输入空间，长备注又会显示不全。
+// 修改方式：把备注覆盖层和 Key 输入层封装到独立组件中，用 ref 与 useLayoutEffect 测量真实渲染宽度，并直接写入 DOM mask 样式，避免通过 state 触发重绘闪烁。
+// 目的：让 Key 输入内容的透明区域随备注文字宽度变化，同时保留右侧标签渐隐和无备注时的旧 60% 标签遮罩。
+function KeyLabelOverlay({ label, hasTag, isFocused, children }: { label?: string; hasTag: boolean; isFocused: boolean; children: React.ReactNode }) {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const keyInputMaskRef = useRef<HTMLDivElement | null>(null);
+  const labelSpanRef = useRef<HTMLSpanElement | null>(null);
+
+  const setMaskImage = useCallback((el: HTMLElement, mask: string) => {
+    el.style.maskImage = mask;
+    el.style.setProperty('-webkit-mask-image', mask);
+  }, []);
+
+  const clearMaskImage = useCallback((el: HTMLElement) => {
+    el.style.maskImage = '';
+    el.style.removeProperty('-webkit-mask-image');
+  }, []);
+
+  const applyMasks = useCallback(() => {
+    const keyInputMaskEl = keyInputMaskRef.current;
+    if (!keyInputMaskEl) return;
+
+    if (isFocused) {
+      clearMaskImage(keyInputMaskEl);
+      if (labelSpanRef.current) clearMaskImage(labelSpanRef.current);
+      return;
+    }
+
+    const labelSpanEl = labelSpanRef.current;
+    const containerEl = containerRef.current;
+    if (label && labelSpanEl && containerEl && containerEl.clientWidth > 0) {
+      const labelWidth = labelSpanEl.scrollWidth;
+      const containerWidth = containerEl.clientWidth;
+      const labelPct = Math.min(95, (labelWidth / containerWidth) * 100 + 5);
+      const keyMask = hasTag
+        ? `linear-gradient(to right, transparent 0%, transparent ${labelPct - 5}%, black ${labelPct + 15}%, black ${Math.max(65, labelPct + 15)}%, transparent 100%)`
+        : `linear-gradient(to right, transparent 0%, transparent ${labelPct - 5}%, black ${labelPct + 15}%, black 100%)`;
+      setMaskImage(keyInputMaskEl, keyMask);
+      // label 不加 mask — 尽量完整显示，超出容器时靠 overflow-hidden 自然截断
+      clearMaskImage(labelSpanEl);
+      return;
+    }
+
+    if (labelSpanEl) clearMaskImage(labelSpanEl);
+    if (hasTag) {
+      setMaskImage(keyInputMaskEl, 'linear-gradient(to right, black 0%, black 60%, transparent 100%)');
+    } else {
+      clearMaskImage(keyInputMaskEl);
+    }
+  }, [clearMaskImage, hasTag, isFocused, label, setMaskImage]);
+
+  useLayoutEffect(() => {
+    applyMasks();
+
+    const containerEl = containerRef.current;
+    if (!containerEl || typeof ResizeObserver === 'undefined') return;
+
+    const resizeObserver = new ResizeObserver(() => applyMasks());
+    resizeObserver.observe(containerEl);
+    if (labelSpanRef.current) resizeObserver.observe(labelSpanRef.current);
+
+    return () => resizeObserver.disconnect();
+  }, [applyMasks]);
+
+  const bindLabelSpan = useCallback((el: HTMLSpanElement | null) => {
+    labelSpanRef.current = el;
+    applyMasks();
+  }, [applyMasks]);
+
+  const bindKeyInputMask = useCallback((el: HTMLDivElement | null) => {
+    keyInputMaskRef.current = el;
+    applyMasks();
+  }, [applyMasks]);
+
+  return (
+    <div ref={containerRef} className="flex-1 min-w-0 relative z-[2]">
+      {label && !isFocused && (
+        <div className="absolute inset-y-0 left-0 right-0 flex items-center pointer-events-none z-[3] select-none overflow-hidden">
+          <span
+            ref={bindLabelSpan}
+            className="text-sm leading-5 font-mono font-semibold text-amber-600 dark:text-amber-400 whitespace-nowrap"
+          >
+            {label}
+          </span>
+        </div>
+      )}
+
+      <div ref={bindKeyInputMask}>{children}</div>
+    </div>
+  );
+}
 
 // ========== Types ==========
 interface ApiKeyObj {
   key: string;
   disabled: boolean;
+  label?: string;
 }
 
 interface ModelMapping {
@@ -50,6 +164,10 @@ interface SubChannelFormData {
   enabled?: boolean;
   remark?: string;
   base_url?: string;
+  // 修改原因：OAuth 子渠道在完整编辑时也会复用同一份表单结构，需要保留独立 token endpoint 字段。
+  // 修改方式：在子渠道表单数据中加入可选 token_url，并在序列化时只保存显式填写的值。
+  // 目的：避免子渠道编辑时丢失用户配置的 OAuth token exchange/refresh 地址。
+  token_url?: string;
   model_prefix?: string;
   _collapsed?: boolean;
 }
@@ -59,6 +177,10 @@ interface ProviderFormData {
   remark: string;
   engine: string;
   base_url: string;
+  // 修改原因：OAuth 渠道的 API 地址和 token endpoint 需要分开保存，不能继续复用 base_url。
+  // 修改方式：在主渠道表单数据中加入 token_url，保存时随 provider payload 一起提交。
+  // 目的：编辑已有渠道可以回显 token_url，新建或保存渠道时也能持久化该字段。
+  token_url: string;
   api_keys: ApiKeyObj[];
   model_prefix: string;
   enabled: boolean;
@@ -75,7 +197,17 @@ interface ChannelOption {
   id: string;
   type_name: string;
   default_base_url: string;
+  default_token_url?: string;
   description?: string;
+  // 修改原因：后端渠道注册表新增 OAuth 标记，前端应优先使用服务端返回值判断管理 UI 分支。
+  // 修改方式：在 ChannelOption 中加入可选 is_oauth 字段，兼容旧后端未返回该字段的情况。
+  // 目的：余额按钮和配置面板不再只依赖硬编码 OAuth 引擎集合。
+  is_oauth?: boolean;
+  // 修改原因：渠道元数据会返回通用插槽字典，前端需要类型字段承接。
+  // 修改方式：在 ChannelOption 中加入可选 ui_slots 字典字段，key 为插槽名，value 为内联 JS。
+  // 目的：让渠道列表加载后可以按插槽名缓存脚本并交给对应插槽组件动态渲染。
+  ui_slots?: Record<string, string>;
+  source?: string;
 }
 
 interface PluginOption {
@@ -124,7 +256,13 @@ const SCHEDULE_ALGORITHMS = [
   { value: 'fixed_priority', label: '固定优先级 (Fixed)' },
   { value: 'random', label: '随机 (Random)' },
   { value: 'smart_round_robin', label: '智能轮询 (Smart)' },
+  { value: 'sticky_ip', label: 'IP 粘滞 (Sticky IP)' },
 ];
+
+// 修改原因：codex、claude-code 和 antigravity 的凭据来自 OAuth 账号，不应继续按普通 sk-* API Key 处理。
+// 修改方式：集中维护 OAuth 类型引擎集合，并在编辑表单中用当前 engine 派生渲染分支。
+// 目的：让新增 OAuth 引擎时只需要扩展这个集合，Key 管理 UI 自动切换到账号管理模式。
+const OAUTH_ENGINES = new Set(['codex', 'claude-code', 'antigravity', 'gemini-cli']);
 
 function readBooleanPreference(value: any): boolean {
   // 修改原因：后端新增 pool_sharing 布尔开关，旧配置中也可能存在字符串形式的布尔值。
@@ -134,21 +272,63 @@ function readBooleanPreference(value: any): boolean {
   return Boolean(value);
 }
 
+function serializeChannelPreferences(preferences: Record<string, any>): Record<string, any> {
+  // 修改原因：Key Rules 的 retry 默认态和 remap 空值不能原样写入配置，否则后端会难以区分默认和显式动作。
+  // 修改方式：保存和测试预览前复制 preferences，并用统一 helper 清理 key_rules 字段。
+  // 目的：保证 retry 只在强制重试或禁止重试时保存，remap 只在填写有效目标状态码时保存。
+  const next = { ...(preferences || {}) };
+  if (Array.isArray(next.key_rules)) {
+    next.key_rules = sanitizeKeyRulesForSave(next.key_rules);
+  }
+  return next;
+}
+
 // ── 余额类型 ──
 interface BalanceResult {
   supported: boolean;
-  value_type?: 'amount' | 'percent';
+  value_type?: 'amount' | 'percent' | 'quota';
   total?: number | null;
   used?: number | null;
   available?: number | null;
   percent?: number | null;
+  // 修改原因：OAuth 余额入口会在通用 BalanceResult 外额外返回 5 小时和 7 天 quota。
+  // 修改方式：把两个 OAuth quota 字段和逐账号 results 映射加入可选类型。
+  // 目的：同一个查询函数既能更新普通余额行，也能刷新 OAuth 双弧展示。
+  quota_5h?: number | null;
+  quota_7d?: number | null;
+  results?: Record<string, BalanceResult>;
+  // 修改原因：oai_tier 会通过 balance_enricher 在普通余额结果中补充被动检测到的 OpenAI Tier 信息。
+  // 修改方式：在通用 BalanceResult 类型中加入 tier、tpm、rpm 和检测元数据字段。
+  // 目的：让非 OAuth Key 行可以类型安全地读取并显示 Tier 标签。
+  tier?: string | null;
+  tpm?: number | null;
+  rpm?: number | null;
+  tier_detected_at?: number | null;
+  tier_model?: string | null;
+  // 修改原因：resultForKey 现在显式标注为 BalanceResult，原有 OAuth 额外用量字段也需要在类型中声明。
+  // 修改方式：补齐 extra_usage 相关可选字段，不改变现有 OAuth 渲染逻辑。
+  // 目的：保持前端严格类型检查通过，同时让本次 tier 类型收敛不破坏旧字段读取。
+  extra_usage_enabled?: boolean | null;
+  extra_usage_limit?: number | null;
+  extra_usage_used?: number | null;
+  extra_usage_utilization?: number | null;
   raw?: any;
   error?: string | null;
+}
+
+// 修改原因：OAuth 账号的可视化指标不是普通余额，而是 5 小时和 7 天两个窗口的配额百分比。
+// 修改方式：为页面内的 OAuth 配额读写定义轻量类型，后续由 getOAuthQuota 统一归一化。
+// 目的：让 Key 行渲染可以明确区分普通余额和 OAuth 双弧配额。
+interface OAuthQuota {
+  quota_5h?: number;
+  quota_7d?: number;
+  raw?: any;
 }
 
 function getBalancePercent(b: BalanceResult): number | null {
   if (!b.supported || b.error) return null;
   if (b.value_type === 'percent' && b.percent != null) return b.percent;
+  if (b.value_type === 'quota' && b.available != null) return Math.min(b.available, 100);
   if (b.total != null && b.total > 0 && b.available != null) return (b.available / b.total) * 100;
   return null;
 }
@@ -166,6 +346,46 @@ function getBalanceLabel(b: BalanceResult): string | null {
   if (b.available != null && b.total != null) return `${b.available.toFixed(1)} / ${b.total.toFixed(1)}`;
   if (b.available != null) return `${b.available.toFixed(1)}`;
   return null;
+}
+
+function normalizeQuotaPct(value: any): number | undefined {
+  // 修改原因：OAuth 余额来源既可能是后端数字，也可能是缓存字符串，直接参与弧线长度计算会产生 NaN。
+  // 修改方式：统一把空值转为 undefined，把可解析数字裁剪到 0 到 100。
+  // 目的：保证通用 OAuth 双弧只接收稳定百分比，渠道专属计算由后端或 ui_slots 完成。
+  if (value == null || value === '') return undefined;
+  const n = Number(value);
+  if (!Number.isFinite(n)) return undefined;
+  return Math.max(0, Math.min(100, n));
+}
+
+function getOAuthQuota(account: any): OAuthQuota | null {
+  // 修改原因：Channels.tsx 不应包含 Antigravity 等渠道专属 quota 分组逻辑，否则通用前端会绑定具体 engine。
+  // 修改方式：只读取后端缓存的 quota_5h、quota_7d 并归一化，同时把 raw 原样传给渠道 QUOTA_UI 插槽。
+  // 目的：让 QuotaBorderOverlay 使用统一字段，渠道自己的计算和展示逻辑留在后端 fetch_quota 与 ui_slots 中。
+  if (!account) return null;
+  const quota_5h = normalizeQuotaPct(account.quota_5h);
+  const quota_7d = normalizeQuotaPct(account.quota_7d);
+  const raw = account.quota_raw ?? account.raw ?? undefined;
+  if (quota_5h == null && quota_7d == null && raw == null) return null;
+  return { quota_5h, quota_7d, raw };
+}
+
+function sortProvidersByWeight(list: any[]): any[] {
+  // 修改原因：保存后需要从后端重新获取 providers，并继续保持页面原有的权重降序显示。
+  // 修改方式：把原先散落在加载和保存逻辑中的排序规则抽成纯 helper。
+  // 目的：避免刷新、保存和权重更新使用不同排序实现导致列表顺序不一致。
+  return [...list].sort((a, b) => {
+    const weightA = a.preferences?.weight ?? a.weight ?? 0;
+    const weightB = b.preferences?.weight ?? b.weight ?? 0;
+    return weightB - weightA;
+  });
+}
+
+function buildProviderApiPath(providerId: string): string {
+  // 修改原因：provider 名可能包含空格、斜杠或其他需要转义的字符，直接拼 URL 会请求错误路径。
+  // 修改方式：所有单渠道 PUT/DELETE 统一通过 encodeURIComponent 生成路径。
+  // 目的：保证前端调用 /v1/providers/{provider_id} 时按真实渠道名定位。
+  return `/v1/providers/${encodeURIComponent(providerId)}`;
 }
 
 const BALANCE_FILL_COLORS = {
@@ -207,12 +427,203 @@ function buildRoundRectPath(x: number, y: number, w: number, h: number, r: numbe
   ].join(' ');
 }
 
+// 构建圆角矩形上半 path（从左中点顺时针到右中点）
+// 上半 path：左中点 → 左上圆角 → 上边 → 右上圆角 → 右中点
+// 0%=左中点，50%=上边中点，100%=右中点
+function buildTopHalfPath(x: number, y: number, w: number, h: number, r: number) {
+  const my = y + h / 2;
+  return [
+    `M ${x} ${my}`,
+    `L ${x} ${y + r}`,
+    `A ${r} ${r} 0 0 1 ${x + r} ${y}`,
+    `L ${x + w - r} ${y}`,
+    `A ${r} ${r} 0 0 1 ${x + w} ${y + r}`,
+    `L ${x + w} ${my}`,
+  ].join(' ');
+}
+
+// 下半 path：左中点 → 左下圆角 → 下边 → 右下圆角 → 右中点
+// 0%=左中点，50%=下边中点，100%=右中点
+function buildBottomHalfPath(x: number, y: number, w: number, h: number, r: number) {
+  const my = y + h / 2;
+  return [
+    `M ${x} ${my}`,
+    `L ${x} ${y + h - r}`,
+    `A ${r} ${r} 0 0 0 ${x + r} ${y + h}`,
+    `L ${x + w - r} ${y + h}`,
+    `A ${r} ${r} 0 0 0 ${x + w} ${y + h - r}`,
+    `L ${x + w} ${my}`,
+  ].join(' ');
+}
+
+// OAuth 额度边框叠加层 — 上半蓝色(5h)、下半紫色(7d)
+function QuotaBorderOverlay({ quota5h, quota7d }: {
+  quota5h?: number | null; quota7d?: number | null;
+}) {
+  const selfRef = useRef<HTMLDivElement>(null);
+  const [svgViewBox, setSvgViewBox] = useState('');
+  const [topPath, setTopPath] = useState('');
+  const [bottomPath, setBottomPath] = useState('');
+
+  useEffect(() => {
+    const el = selfRef.current;
+    if (!el) return;
+    const update = () => {
+      const w = el.offsetWidth;
+      const h = el.offsetHeight;
+      if (w > 0 && h > 0) {
+        setSvgViewBox(`0 0 ${w} ${h}`);
+        setTopPath(buildTopHalfPath(1, 1, w - 2, h - 2, 7));
+        setBottomPath(buildBottomHalfPath(1, 1, w - 2, h - 2, 7));
+      }
+    };
+    update();
+    const ro = new ResizeObserver(update);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+
+  const q5 = quota5h ?? 0;
+  const q7 = quota7d ?? 0;
+  return (
+    <div ref={selfRef} className="absolute inset-0 pointer-events-none z-[1]" style={{ overflow: 'visible' }}>
+      {svgViewBox && (
+        <svg className="absolute inset-0 w-full h-full" viewBox={svgViewBox} style={{ overflow: 'visible' }}>
+          <title>{`5h: ${quota5h ?? '?'}% \u00b7 7d: ${quota7d ?? '?'}%`}</title>
+          {quota5h != null && topPath && (
+            <path d={topPath} pathLength={100} fill="none" stroke="#3b82f6" strokeWidth={2} strokeLinecap="round"
+              style={{ strokeDasharray: `${q5} 100`, strokeDashoffset: 0, transition: 'stroke-dasharray 0.5s ease' }} />
+          )}
+          {quota7d != null && bottomPath && (
+            <path d={bottomPath} pathLength={100} fill="none" stroke="#8b5cf6" strokeWidth={2} strokeLinecap="round"
+              style={{ strokeDasharray: `${q7} 100`, strokeDashoffset: 0, transition: 'stroke-dasharray 0.5s ease' }} />
+          )}
+        </svg>
+      )}
+    </div>
+  );
+}
+
+// 兼容 QuotaArcs 调用点 — 用最小百分比的文字 tag
+const QuotaArcs = ({ quota5h, quota7d }: { quota5h?: number; quota7d?: number }) => {
+  if (quota5h == null && quota7d == null) return null;
+  const pct = Math.min(quota5h ?? 100, quota7d ?? 100);
+  const color = pct > 50 ? 'bg-emerald-500/15 text-emerald-500' : pct > 20 ? 'bg-amber-500/15 text-amber-600' : 'bg-red-500/15 text-red-500';
+  return (
+    <span
+      className={`flex-shrink-0 text-[10px] font-semibold font-mono px-1.5 py-0.5 rounded relative z-[2] cursor-default ${color}`}
+      title={`5h: ${quota5h ?? '?'}% · 7d: ${quota7d ?? '?'}%`}
+    >
+      {Math.round(pct)}%
+    </span>
+  );
+};
+
+// ── 渠道自定义 UI 插槽 ──
+// 修改原因：前端不能只支持 quota_display，也不能把 CC extra_usage 等渠道专属 UI 写死在 Channels.tsx 中。
+// 修改方式：把原单一额度插槽泛化为 UiSlot，按 engine + slot 缓存渠道注册的内联 JavaScript，并把插槽上下文交给渠道脚本渲染。
+// 目的：让 Channels.tsx 只提供通用挂载点，余额条、标签、汇总和边框等渠道差异都由 channel.py 的 ui_slots 声明。
+const uiSlotCache: Record<string, ((ctx: any) => void) | null> = {};
+
+function serializeSlotValue(value: any): string {
+  // 修改原因：插槽 data/context 多数来自 React state，每次 render 都可能产生新对象引用，直接依赖对象会导致脚本反复执行。
+  // 修改方式：把值序列化成内容签名作为 effect 依赖，实际执行时仍从 ref 读取最新值。
+  // 目的：减少轮询、倒计时和输入聚焦造成的无意义插槽重渲染。
+  try {
+    return JSON.stringify(value ?? null);
+  } catch {
+    return String(value ?? '');
+  }
+}
+
+function hasUiSlot(engine: string | undefined, slot: string): boolean {
+  // 修改原因：多个挂载点都需要判断某个渠道是否注册了对应插槽，直接散落访问 window.__uiSlots 容易写回专用分支。
+  // 修改方式：提供只按 engine 和 slot 查询的通用 helper，不理解任何渠道字段。
+  // 目的：让插槽存在性判断保持平台化，避免出现按具体 engine 名称分支的硬编码。
+  if (!engine) return false;
+  return Boolean((window as any).__uiSlots?.[engine]?.[slot]);
+}
+
+const UiSlot = ({ engine, slot, data, context, className, element = 'span', fallbackText }: { engine: string; slot: string; data: any; context?: Record<string, any>; className?: string; element?: 'span' | 'div'; fallbackText?: string }) => {
+  const ref = useRef<HTMLElement | null>(null);
+  const [loaded, setLoaded] = useState(false);
+  const dataRef = useRef(data);
+  const contextRef = useRef(context);
+  dataRef.current = data;
+  contextRef.current = context;
+  const dataKey = useMemo(() => serializeSlotValue(data), [data]);
+  const contextKey = useMemo(() => serializeSlotValue(context), [context]);
+
+  const bindRef = useCallback((node: HTMLElement | null) => {
+    ref.current = node;
+  }, []);
+
+  useEffect(() => {
+    if (!ref.current) return;
+    const el = ref.current;
+    const cacheKey = `${engine}:${slot}`;
+
+    const run = async () => {
+      try {
+        // 修改原因：同一渠道的同一插槽会被多个 Key 行重复使用，重复 import 会浪费资源并增加闪烁概率。
+        // 修改方式：按 `${engine}:${slot}` 缓存模块函数，命中时直接复用已加载的 render 函数。
+        // 目的：保持列表渲染轻量，同时支持同一渠道注册多个彼此独立的插槽。
+        if (fallbackText !== undefined) el.textContent = fallbackText;
+        if (cacheKey in uiSlotCache) {
+          const fn = uiSlotCache[cacheKey];
+          if (fn) fn({ el, data: dataRef.current, ...(contextRef.current ?? {}) });
+          setLoaded(true);
+          return;
+        }
+
+        // 修改原因：插槽脚本来自渠道元数据，前端只负责按 slot 名加载，不应固定读取 quota_display。
+        // 修改方式：从 window.__uiSlots[engine][slot] 取内联 JS，再通过 Blob URL dynamic import 加载默认导出。
+        // 目的：新增 key_border、key_background、balance_summary、quota_label 时不再修改加载器。
+        const jsSrc = (window as any).__uiSlots?.[engine]?.[slot];
+        if (!jsSrc) {
+          uiSlotCache[cacheKey] = null;
+          setLoaded(true);
+          return;
+        }
+
+        const blob = new Blob([jsSrc], { type: 'application/javascript' });
+        const url = URL.createObjectURL(blob);
+        try {
+          const mod = await import(/* @vite-ignore */ url);
+          const fn = mod.default || mod;
+          uiSlotCache[cacheKey] = typeof fn === 'function' ? fn : null;
+          if (uiSlotCache[cacheKey]) uiSlotCache[cacheKey]!({ el, data: dataRef.current, ...(contextRef.current ?? {}) });
+        } finally {
+          URL.revokeObjectURL(url);
+        }
+        setLoaded(true);
+      } catch (e) {
+        console.warn(`[UiSlot] Failed to load UI slot ${slot} for ${engine}:`, e);
+        uiSlotCache[cacheKey] = null;
+        // 修改原因：插槽脚本失败时继续显示旧 DOM 会误导用户，以为渠道仍在正常渲染。
+        // 修改方式：有默认文本的插槽恢复默认文本，没有默认文本的插槽清空内容和 title。
+        // 目的：让失败插槽安全静默降级，并把排查信息留在控制台。
+        el.textContent = fallbackText ?? '';
+        el.removeAttribute('title');
+        setLoaded(true);
+      }
+    };
+
+    run();
+  }, [engine, slot, dataKey, contextKey, fallbackText]);
+
+  if (element === 'div') {
+    return <div ref={bindRef as React.RefCallback<HTMLDivElement>} data-loaded={loaded ? 'true' : 'false'} className={className} />;
+  }
+  return <span ref={bindRef as React.RefCallback<HTMLSpanElement>} data-loaded={loaded ? 'true' : 'false'} className={className} />;
+};
+
 // ── 冷却中 Key 行组件（SVG 边框进度） ──
-function CoolingKeyRow({ idx, keyObj, remainSec, totalDuration, focused, onFocus, onBlur, onRecover, onToggle, onTest, onDelete }: {
-  idx: number; keyObj: { key: string; disabled: boolean }; remainSec: number; totalDuration: number;
+function CoolingKeyRow({ idx, keyObj, remainSec, totalDuration, focused, onFocus, onBlur, onRecover, onToggle, onTest, onDelete, onLabelChange }: {
+  idx: number; keyObj: { key: string; disabled: boolean; label?: string }; remainSec: number; totalDuration: number;
   focused: boolean;
   onFocus: () => void; onBlur: () => void;
-  onRecover: () => void; onToggle: () => void; onTest: () => void; onDelete: () => void;
+  onRecover: () => void; onToggle: () => void; onTest: () => void; onDelete: () => void; onLabelChange?: (label: string) => void;
 }) {
   const wrapperRef = useRef<HTMLDivElement>(null);
   const [svgViewBox, setSvgViewBox] = useState('');
@@ -265,10 +676,13 @@ function CoolingKeyRow({ idx, keyObj, remainSec, totalDuration, focused, onFocus
       {/* 内容 */}
       <div className={`relative flex items-center gap-2 px-3 py-2 rounded-lg border-2 transition-colors ${focused ? 'border-blue-500 bg-muted/50' : 'border-border bg-background dark:bg-card'}`}>
         <span className="text-xs text-muted-foreground w-4 text-right relative z-[2]">{idx + 1}</span>
+        {keyObj.label && !focused && (
+          <span className="text-sm font-mono font-semibold text-amber-600 dark:text-amber-400 truncate max-w-[30%] flex-shrink-0 relative z-[2]">{keyObj.label}</span>
+        )}
         <div className="flex-1 min-w-0 relative z-[2]">
           <input
             type="text" value={keyObj.key || ''} readOnly placeholder="sk-..."
-            onFocus={onFocus} onBlur={onBlur}
+            onFocus={onFocus} onBlur={e => { if (!wrapperRef.current?.contains(e.relatedTarget as Node)) onBlur(); }}
             className={`w-full bg-transparent border-none text-sm font-mono outline-none ${focused ? 'text-foreground' : 'text-red-400 dark:text-red-300 line-through decoration-red-500/40'}`}
           />
           {/* 倒计时叠加 */}
@@ -286,6 +700,20 @@ function CoolingKeyRow({ idx, keyObj, remainSec, totalDuration, focused, onFocus
           <button onClick={onTest} disabled={!keyObj.key.trim()} className="text-blue-600 dark:text-blue-400 disabled:opacity-50"><Play className="w-4 h-4" /></button>
           <button onClick={onDelete} className="text-red-500 hover:text-red-400 ml-1"><Trash2 className="w-4 h-4" /></button>
         </div>
+        {/* Label 编辑：聚焦时在行底部展开 */}
+        {focused && onLabelChange && (
+          <div className="absolute left-0 right-0 -bottom-6 flex items-center gap-1 z-[5]">
+            <span className="text-[10px] text-muted-foreground/50 pl-8">备注:</span>
+            <input
+              type="text"
+              value={keyObj.label || ''}
+              onChange={e => onLabelChange(e.target.value)}
+              onFocus={onFocus}
+              placeholder="点击添加备注"
+              className="flex-1 bg-background/80 backdrop-blur-sm border border-border/50 rounded px-2 py-0.5 text-[11px] text-amber-600 dark:text-amber-400 font-mono outline-none focus:border-amber-500/50 placeholder:text-muted-foreground/30"
+            />
+          </div>
+        )}
       </div>
     </div>
   );
@@ -302,6 +730,11 @@ export default function Channels() {
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [originalIndex, setOriginalIndex] = useState<number | null>(null);
   const [formData, setFormData] = useState<ProviderFormData | null>(null);
+  // 修改原因：移动端浏览器在 Radix Dialog 给 body 设置 overflow:hidden 时可能把页面滚动位置重置到顶部。
+  // 修改方式：用 ref 保存打开抽屉前的 scrollY 和 body 原有内联样式，避免用 state 触发重渲染或闭包拿到旧值。
+  // 目的：关闭渠道编辑抽屉后准确恢复背后渠道列表的原始滚动位置。
+  const channelModalScrollYRef = useRef(0);
+  const channelModalBodyStyleRef = useRef<{ position: string; top: string; width: string } | null>(null);
 
   // 子渠道编辑模式：parentIdx = 主渠道在 providers 里的 index，subIdx = sub_channels 里的 index
   const [editingSubChannel, setEditingSubChannel] = useState<{ parentIdx: number; subIdx: number } | null>(null);
@@ -328,6 +761,33 @@ export default function Channels() {
   const [balanceLoading, setBalanceLoading] = useState(false);
   const [focusedKeyIdx, setFocusedKeyIdx] = useState<number | null>(null);
 
+  // 修改原因：OAuth 类型引擎需要展示已导入账号状态，并允许把 refresh_token 导入为账号标识。
+  // 修改方式：新增账号列表、导入弹窗目标下标、待提交 token 和提交中状态。
+  // 目的：让 OAuth Key 行可以在不暴露 token 明文的情况下完成账号导入和状态展示。
+  const [oauthAccounts, setOauthAccounts] = useState<Record<string, any>>({});
+  // 修改原因：OAuth key 输入框 onChange 会立即更新表单值，onBlur 时需要知道焦点进入前的旧标识符。
+  // 修改方式：用 ref 按行下标保存 focus 时的 key 快照，不触发表单重渲染。
+  // 目的：在用户把 OAuth 账号标识改名后，可以调用 rename API 同步 oauth_state.json。
+  const oauthKeyFocusSnapshotRef = useRef<Record<number, string>>({});
+  const [importModalIdx, setImportModalIdx] = useState<number | null>(null);
+  const [importToken, setImportToken] = useState('');
+  const [importing, setImporting] = useState(false);
+  // 修改原因：manual OAuth 模式需要在弹窗登录后接收用户复制的 localhost 回调完整 URL。
+  // 修改方式：保存当前 Key 行下标、state、用户粘贴的 URL 和交换中的提交状态。
+  // 目的：替代旧的跨窗口 location 轮询和 prompt 降级，避免 COOP 或跨域策略导致登录不可用。
+  const [oauthManualState, setOauthManualState] = useState<{ idx: number; state: string; provider: string } | null>(null);
+  const [manualUrl, setManualUrl] = useState('');
+  const [exchanging, setExchanging] = useState(false);
+  // 修改原因：OAuth 导入和手动回调弹窗通过 document.body portal 渲染，仍会被编辑抽屉的 Radix Dialog 焦点锁拉回。
+  // 修改方式：把两个 OAuth 弹窗状态合并成一个布尔值，供编辑抽屉外部焦点和外部交互事件共用。
+  // 目的：只在 OAuth 覆盖弹窗打开期间放行 portal 焦点，关闭后恢复编辑抽屉原有的模态行为。
+  const isOAuthOverlayOpen = importModalIdx !== null || oauthManualState !== null;
+  const selectedChannelType = channelTypes.find(c => c.id === (formData?.engine || ''));
+  // 修改原因：后端已经能返回 is_oauth，但旧部署或加载失败时仍需要保留前端硬编码兜底。
+  // 修改方式：优先读取渠道类型的 is_oauth，缺失时回退到 OAUTH_ENGINES 集合。
+  // 目的：新增 OAuth 引擎只要后端注册标记正确，前端余额和配置区域即可自动适配。
+  const isOAuthEngine = selectedChannelType?.is_oauth ?? OAUTH_ENGINES.has(formData?.engine || '');
+
   // ── 全局配置（用于价格提示等）──
   const [globalModelPrice, setGlobalModelPrice] = useState<Record<string, string>>({});
 
@@ -347,7 +807,7 @@ export default function Channels() {
   // 修改原因：虚拟模型抽屉左栏在大屏下长期占用过多横向空间。
   // 修改方式：新增左栏折叠状态，并默认折叠为窄侧边条。
   // 目的：打开抽屉时优先保证右侧链条编辑区空间充足，按需再展开渠道列表。
-  const [isVirtualProviderPanelCollapsed, setIsVirtualProviderPanelCollapsed] = useState(true);
+  const [isVirtualProviderPanelCollapsed, setIsVirtualProviderPanelCollapsed] = useState(false);
   // 修改原因：移动端渠道面板需要默认折叠，但又不能复用桌面端窄侧栏的折叠形态。
   // 修改方式：新增独立的移动端展开状态，只控制小屏顶部渠道面板的展开和收起。
   // 目的：手机上先显示链条编辑区，同时允许用户按需查看完整渠道列表。
@@ -374,6 +834,114 @@ export default function Channels() {
 
   const { token } = useAuthStore();
 
+  const restoreChannelModalScrollLock = useCallback(() => {
+    // 修改原因：渠道编辑抽屉关闭或组件卸载时，body 仍可能保留 fixed 定位，导致页面停在错误位置。
+    // 修改方式：只在存在样式快照时恢复 position、top、width，并用 ref 中保存的 scrollY 调回原列表位置。
+    // 目的：让移动端关闭抽屉后回到打开前浏览的渠道卡片，而不是回到列表顶部。
+    const previousStyle = channelModalBodyStyleRef.current;
+    if (!previousStyle) return;
+
+    const body = document.body;
+    const scrollY = channelModalScrollYRef.current;
+    body.style.position = previousStyle.position;
+    body.style.top = previousStyle.top;
+    body.style.width = previousStyle.width;
+    channelModalBodyStyleRef.current = null;
+    window.scrollTo(0, scrollY);
+  }, []);
+
+  // 修改原因：useEffect 跑得太晚——Radix Dialog mount 时内部 useLayoutEffect 先执行，给 body 加 overflow:hidden，
+  //          移动端浏览器在此时就重置了 scrollTop，等我们的 useEffect 记录 scrollY 时已经是 0 了。
+  // 修改方式：scroll lock 逻辑改为：锁定在 openModal 的 setIsModalOpen(true) 之前同步执行（见下方 applyChannelModalScrollLock），
+  //          解锁仍在 useEffect 中监听 isModalOpen 变为 false 时恢复。
+  // 目的：确保在 Radix Dialog mount 之前就固定 body，scrollY 不会被重置。
+  const applyChannelModalScrollLock = useCallback(() => {
+    if (channelModalBodyStyleRef.current) return;
+    const body = document.body;
+    const currentScrollY = window.scrollY || window.pageYOffset || document.documentElement.scrollTop || 0;
+    channelModalScrollYRef.current = currentScrollY;
+    channelModalBodyStyleRef.current = {
+      position: body.style.position,
+      top: body.style.top,
+      width: body.style.width,
+    };
+    body.style.position = 'fixed';
+    body.style.top = `-${currentScrollY}px`;
+    body.style.width = '100%';
+  }, []);
+
+  useEffect(() => {
+    if (!isModalOpen) {
+      restoreChannelModalScrollLock();
+    }
+    return restoreChannelModalScrollLock;
+  }, [isModalOpen, restoreChannelModalScrollLock]);
+
+  const applyApiConfigData = (data: any, options: { syncVirtualModels?: boolean } = {}) => {
+    // 修改原因：初始加载和单渠道保存后的刷新都要把 /v1/api_config 响应写回页面状态，但普通 provider 刷新不应覆盖未保存的虚拟路由草稿。
+    // 修改方式：始终刷新 providers 和价格；只有初始加载显式传 syncVirtualModels 时才同步 virtual_models。
+    // 目的：避免局部保存成功后继续使用本地拼接数组，同时保护用户正在编辑的虚拟模型配置。
+    const rawProviders = data.providers || data.api_config?.providers || [];
+    const sortedProviders = sortProvidersByWeight(Array.isArray(rawProviders) ? rawProviders : []);
+    setProviders(sortedProviders);
+
+    const globalPrefs = data.preferences || data.api_config?.preferences || {};
+    setGlobalModelPrice(globalPrefs.model_price || {});
+    if (!options.syncVirtualModels) return;
+
+    // 修改原因：虚拟模型路由由 /v1/api_config 的全局 preferences 返回。
+    // 修改方式：读取 preferences.virtual_models 并在缺失时回退为空对象。
+    // 目的：页面初始加载后展示已配置的全局虚拟模型路由。
+    const loadedVirtualModels = globalPrefs.virtual_models || {};
+    setVirtualModels(loadedVirtualModels);
+    setVirtualModelsDirty(false);
+    // 修改原因：虚拟模型现在通过渠道列表卡片进入抽屉编辑，旧画布展开状态不再承担主要展示职责。
+    // 修改方式：仍保留已有展开状态初始化，供历史函数和后续兼容逻辑使用。
+    // 目的：减少 UI 重构对既有状态和 CRUD 函数的破坏范围。
+    setExpandedVirtualModels(prev => prev.size > 0 ? prev : new Set(Object.keys(loadedVirtualModels).slice(0, 1)));
+  };
+
+  const refreshProviders = async (options: { syncVirtualModels?: boolean } = {}) => {
+    // 修改原因：主渠道新增、更新、删除都改为单渠道 API，成功后不能再用本地数组推断最终状态。
+    // 修改方式：重新请求 /v1/api_config，并通过 applyApiConfigData 写回后端最新 providers。
+    // 目的：消除多浏览器并发保存时的陈旧状态风险。
+    const res = await apiFetch('/v1/api_config', { headers: { Authorization: `Bearer ${token}` } });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(fmtErr(err, res.status));
+    }
+    const data = await res.json();
+    applyApiConfigData(data, options);
+  };
+
+  const refreshSingleProvider = async (providerId: string) => {
+    // 单渠道局部刷新：GET 单个 provider 后替换本地数组对应项，避免拉全量 200KB
+    try {
+      const res = await apiFetch(buildProviderApiPath(providerId), {
+        method: 'GET',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!res.ok) {
+        // fallback 到全量刷新
+        await refreshProviders();
+        return;
+      }
+      const data = await res.json();
+      if (!data?.provider) {
+        await refreshProviders();
+        return;
+      }
+      setProviders(prev => {
+        const updated = prev.map(p =>
+          String(p.provider || '') === providerId ? data.provider : p
+        );
+        return sortProvidersByWeight(updated);
+      });
+    } catch {
+      await refreshProviders();
+    }
+  };
+
   const fetchInitialData = async () => {
     try {
       const headers = { Authorization: `Bearer ${token}` };
@@ -395,39 +963,25 @@ export default function Channels() {
         setLocalCountdowns(countdowns);
       }).catch(() => {});
 
-      const [configRes, typesRes, pluginsRes, activityRes] = await Promise.all([
-        apiFetch('/v1/api_config', { headers }),
+      const [_providersRefreshed, typesRes, pluginsRes, activityRes] = await Promise.all([
+        refreshProviders({ syncVirtualModels: true }),
         apiFetch('/v1/channels', { headers }),
         apiFetch('/v1/plugins/interceptors', { headers }),
         apiFetch('/v1/stats/provider_activity', { headers }).catch(() => null),
       ]);
 
-      if (configRes.ok) {
-        const data = await configRes.json();
-        const rawProviders = data.providers || data.api_config?.providers || [];
-        // 按权重降序排序
-        const sortedProviders = [...rawProviders].sort((a, b) => {
-          const weightA = a.preferences?.weight ?? a.weight ?? 0;
-          const weightB = b.preferences?.weight ?? b.weight ?? 0;
-          return weightB - weightA;
-        });
-        setProviders(sortedProviders);
-        const globalPrefs = data.preferences || data.api_config?.preferences || {};
-        setGlobalModelPrice(globalPrefs.model_price || {});
-        // 修改原因：虚拟模型路由由 /v1/api_config 的全局 preferences 返回。
-        // 修改方式：读取 preferences.virtual_models 并在缺失时回退为空对象。
-        // 目的：页面加载后立即展示已配置的全局虚拟模型路由。
-        const loadedVirtualModels = globalPrefs.virtual_models || {};
-        setVirtualModels(loadedVirtualModels);
-        setVirtualModelsDirty(false);
-        // 修改原因：虚拟模型现在通过渠道列表卡片进入抽屉编辑，旧画布展开状态不再承担主要展示职责。
-        // 修改方式：仍保留已有展开状态初始化，供历史函数和后续兼容逻辑使用。
-        // 目的：减少本次 UI 重构对既有状态和 CRUD 函数的破坏范围。
-        setExpandedVirtualModels(prev => prev.size > 0 ? prev : new Set(Object.keys(loadedVirtualModels).slice(0, 1)));
-      }
       if (typesRes.ok) {
         const data = await typesRes.json();
-        setChannelTypes(data.channels || []);
+        const channelList = data.channels || [];
+        // 修改原因：UiSlot 需要按 engine + 插槽名获取渠道内联 JS 脚本。
+        // 修改方式：在渠道列表加载成功后，把各渠道的 ui_slots 缓存到 window.__uiSlots。
+        // 目的：后续插槽组件渲染时可按 engine + slot 名查找并动态加载。
+        const uiSlots: Record<string, Record<string, string>> = {};
+        for (const ch of channelList) {
+          if (ch.ui_slots) uiSlots[ch.id] = ch.ui_slots;
+        }
+        (window as any).__uiSlots = uiSlots;
+        setChannelTypes(channelList);
       }
       if (pluginsRes.ok) {
         const data = await pluginsRes.json();
@@ -504,13 +1058,138 @@ export default function Channels() {
 
   // ── 打开编辑面板时自动查询余额 ──
   useEffect(() => {
-    if (isModalOpen && formData?.preferences?.balance && formData.base_url && formData.api_keys.some(k => k.key.trim() && !k.disabled)) {
+    // 修改原因：OAuth 编辑面板已有专门的账号列表 quota 拉取逻辑，不能再要求 preferences.balance。
+    // 修改方式：自动余额查询只保留给普通渠道，OAuth 余额由账号列表和手动余额按钮触发。
+    // 目的：避免打开 OAuth 面板时因为缺少普通余额配置产生无效请求。
+    if (isModalOpen && !isOAuthEngine && formData?.base_url && formData?.api_keys?.some(k => k.key.trim() && !k.disabled)) {
       queryAllBalances(true);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isModalOpen]);
 
-  const openModal = (provider: any = null, index: number | null = null) => {
+  const refreshOAuthAccounts = useCallback(async () => {
+    // 修改原因：OAuth 账号列表既要在打开编辑面板时加载，也要在浏览器登录成功后刷新，且后端 state 已按 provider name 分层。
+    // 修改方式：把 /v1/oauth/accounts?provider=当前渠道名 请求封装为 useCallback 函数，成功时写入 oauthAccounts，失败时清空。
+    // 目的：避免加载其他渠道的同邮箱账号，降低账号状态不同步和跨渠道误展示风险。
+    const providerName = (formData?.provider || '').trim();
+    if (!providerName) {
+      setOauthAccounts({});
+      return;
+    }
+    try {
+      const res = await apiFetch(`/v1/oauth/accounts?provider=${encodeURIComponent(providerName)}`, { headers: { Authorization: `Bearer ${token}` } });
+      if (!res.ok) {
+        setOauthAccounts({});
+        return;
+      }
+      const data = await res.json();
+      setOauthAccounts(data || {});
+    } catch {
+      setOauthAccounts({});
+    }
+  }, [token, formData?.provider]);
+
+  // ── 打开 OAuth 编辑面板时同步账号状态 ──
+  useEffect(() => {
+    // 修改原因：OAuth Key 行需要根据后端运行时状态展示账号是否连接以及配额数据。
+    // 修改方式：仅在编辑面板打开且当前 engine 属于 OAuth 类型时调用 refreshOAuthAccounts。
+    // 目的：避免普通渠道产生额外请求，同时保证 OAuth 账号列表来自后端最新状态。
+    if (isModalOpen && isOAuthEngine) {
+      refreshOAuthAccounts();
+    } else if (!isModalOpen) {
+      setOauthAccounts({});
+    }
+  }, [isModalOpen, isOAuthEngine, refreshOAuthAccounts]);
+
+  useEffect(() => {
+    // OAuth 弹窗打开时，对尚无 quota 的活跃账号批量调 /balance 查询额度。
+    if (!isModalOpen || !isOAuthEngine) return;
+    const providerName = (formData?.provider || '').trim();
+    if (!providerName) return;
+    const targets = Object.entries(oauthAccounts).filter(([, account]) => (
+      account?.status === 'active'
+      && account.quota_5h == null
+      && account.quota_7d == null
+      && !account._quota_loading
+      && !account._quota_unavailable
+    ));
+    if (targets.length === 0) return;
+
+    // 标记所有目标为 loading
+    setOauthAccounts(prev => {
+      const next = { ...prev };
+      for (const [keyId] of targets) {
+        if (next[keyId]) next[keyId] = { ...next[keyId], _quota_loading: true };
+      }
+      return next;
+    });
+
+    // 一次 /balance 调用，后端会逐 key 查询并聚合返回
+    apiFetch('/v1/channels/balance', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({
+        provider: formData?.provider,
+        engine: formData?.engine,
+        base_url: formData?.base_url,
+        api_key: targets.map(([keyId]) => keyId),
+        preferences: formData?.preferences,
+      }),
+    })
+      .then(async res => {
+        if (res.ok) return await res.json();
+        try {
+          const errBody = await res.json();
+          toastWarning(errBody?.error || `HTTP ${res.status}`);
+        } catch { /* ignore */ }
+        return null;
+      })
+      .then(data => {
+        setOauthAccounts(prev => {
+          const next = { ...prev };
+          const perAccount = data?.results || {};
+          for (const [keyId] of targets) {
+            const current = next[keyId];
+            if (!current) continue;
+            const { _quota_loading: _unusedLoading, ...accountWithoutLoading } = current;
+            const result = perAccount[keyId] || data;
+            if (result && typeof result === 'object') {
+              const hasQuota = result.quota_5h != null || result.quota_7d != null;
+              next[keyId] = {
+                ...accountWithoutLoading,
+                ...(result.quota_5h != null ? { quota_5h: result.quota_5h } : {}),
+                ...(result.quota_7d != null ? { quota_7d: result.quota_7d } : {}),
+                ...(result.raw ? { quota_raw: result.raw } : {}),
+                ...(result.extra_usage_enabled ? {
+                  extra_usage_enabled: true,
+                  extra_usage_limit: result.extra_usage_limit,
+                  extra_usage_used: result.extra_usage_used,
+                  extra_usage_utilization: result.extra_usage_utilization,
+                } : {}),
+                _quota_unavailable: !hasQuota && !result.extra_usage_enabled,
+              };
+            } else {
+              next[keyId] = { ...accountWithoutLoading, _quota_unavailable: true };
+            }
+          }
+          return next;
+        });
+      })
+      .catch(() => {
+        setOauthAccounts(prev => {
+          const next = { ...prev };
+          for (const [keyId] of targets) {
+            const current = next[keyId];
+            if (!current) continue;
+            const { _quota_loading: _unusedLoading, ...accountWithoutLoading } = current;
+            next[keyId] = { ...accountWithoutLoading, _quota_unavailable: true };
+          }
+          return next;
+        });
+      });
+  }, [isModalOpen, isOAuthEngine, oauthAccounts, token, formData?.provider]);
+
+  const openModal = async (provider: any = null, index: number | null = null) => {
     setOriginalIndex(index);
     setGroupInput('');
     setModelInput('');
@@ -522,18 +1201,67 @@ export default function Channels() {
     setFocusedKeyIdx(null);
 
     if (provider) {
-      const parseApiKey = (keyStr: string) => {
-        const trimmed = String(keyStr).trim();
+      // 修改原因：编辑主渠道时，页面内存中的 providers 可能已经落后于后端配置。
+      // 修改方式：只有真实主渠道编辑会带 index，此时先 GET 单个 provider；复制渠道的 index 为 null，继续使用本地副本。
+      // 目的：避免用户打开编辑面板后用旧快照填表，保存时覆盖其他设备刚写入的新配置。
+      let freshProvider = provider;
+      if (provider && index !== null) {
+        const providerId = String(provider.provider || '').trim();
+        if (providerId) {
+          try {
+            const res = await apiFetch(buildProviderApiPath(providerId), {
+              method: 'GET',
+              headers: { Authorization: `Bearer ${token}` },
+            });
+            if (res.ok) {
+              const data = await res.json();
+              if (data?.provider) freshProvider = data.provider;
+              else toastWarning('获取渠道最新数据失败，已使用页面缓存继续编辑');
+            } else {
+              toastWarning('获取渠道最新数据失败，已使用页面缓存继续编辑');
+            }
+          } catch {
+            toastWarning('获取渠道最新数据失败，已使用页面缓存继续编辑');
+          }
+        } else {
+          toastWarning('渠道名为空，已使用页面缓存继续编辑');
+        }
+      }
+
+      // 修改原因：后续填表逻辑较长，如果继续直接读 provider 参数，容易遗漏旧快照引用。
+      // 修改方式：统一把最终数据源命名为 activeProvider，GET 成功时它就是后端最新值，失败时是传入的回退值。
+      // 目的：让 API Key、模型、偏好设置和子渠道都从同一个最新快照初始化。
+      const activeProvider = freshProvider;
+      const parseApiKey = (raw: any): ApiKeyObj => {
+        // dict 格式: {"sk-xxx": "label"}
+        if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+          const entries = Object.entries(raw);
+          if (entries.length === 1) {
+            const [k, v] = entries[0];
+            const trimmed = String(k).trim();
+            const label = v ? String(v).trim() : undefined;
+            if (trimmed.startsWith('!')) return { key: trimmed.substring(1), disabled: true, label };
+            return { key: trimmed, disabled: false, label };
+          }
+        }
+        const trimmed = String(raw).trim();
         if (trimmed.startsWith('!')) return { key: trimmed.substring(1), disabled: true };
         return { key: trimmed, disabled: false };
       };
 
-      let parsedKeys: ApiKeyObj[] = [];
-      if (Array.isArray(provider.api)) parsedKeys = provider.api.map(parseApiKey);
-      else if (typeof provider.api === 'string' && provider.api.trim()) parsedKeys = [parseApiKey(provider.api.trim())];
-      else if (Array.isArray(provider.api_keys)) parsedKeys = provider.api_keys.map(parseApiKey);
 
-      const rawModels = Array.isArray(provider.model) ? provider.model : Array.isArray(provider.models) ? provider.models : [];
+      const serializeApiKey = (k: ApiKeyObj): string | Record<string, string> => {
+        const raw = k.disabled ? `!${k.key.trim()}` : k.key.trim();
+        if (k.label) return { [raw]: k.label };
+        return raw;
+      };
+
+      let parsedKeys: ApiKeyObj[] = [];
+      if (Array.isArray(activeProvider.api)) parsedKeys = activeProvider.api.map(parseApiKey);
+      else if (typeof activeProvider.api === 'string' && activeProvider.api.trim()) parsedKeys = [parseApiKey(activeProvider.api.trim())];
+      else if (Array.isArray(activeProvider.api_keys)) parsedKeys = activeProvider.api_keys.map(parseApiKey);
+
+      const rawModels = Array.isArray(activeProvider.model) ? activeProvider.model : Array.isArray(activeProvider.models) ? activeProvider.models : [];
       const models: string[] = [];
       const mappings: ModelMapping[] = [];
 
@@ -547,12 +1275,12 @@ export default function Channels() {
       });
 
       let groups = ["default"];
-      if (Array.isArray(provider.groups) && provider.groups.length > 0) groups = provider.groups;
-      else if (typeof provider.group === 'string' && provider.group.trim()) groups = [provider.group.trim()];
-      else if (provider.preferences?.group) groups = [provider.preferences.group.trim()];
+      if (Array.isArray(activeProvider.groups) && activeProvider.groups.length > 0) groups = activeProvider.groups;
+      else if (typeof activeProvider.group === 'string' && activeProvider.group.trim()) groups = [activeProvider.group.trim()];
+      else if (activeProvider.preferences?.group) groups = [activeProvider.preferences.group.trim()];
 
-      const pHeaders = provider.preferences?.headers || {};
-      const pOverrides = provider.preferences?.post_body_parameter_overrides || {};
+      const pHeaders = activeProvider.preferences?.headers || {};
+      const pOverrides = activeProvider.preferences?.post_body_parameter_overrides || {};
       const entries: HeaderEntry[] = [];
       Object.entries(pHeaders).forEach(([k, v]) => {
         if (Array.isArray(v)) {
@@ -564,15 +1292,15 @@ export default function Channels() {
       setHeaderEntries(entries);
       setOverridesJson(Object.keys(pOverrides).length > 0 ? JSON.stringify(pOverrides, null, 2) : '');
 
-      const pStatusCodeOverrides = provider.preferences?.status_code_overrides || {};
+      const pStatusCodeOverrides = activeProvider.preferences?.status_code_overrides || {};
       setStatusCodeOverridesJson(Object.keys(pStatusCodeOverrides).length > 0 ? JSON.stringify(pStatusCodeOverrides, null, 2) : '');
 
-      const basePreferences = provider.preferences && typeof provider.preferences === 'object'
-        ? provider.preferences
+      const basePreferences = activeProvider.preferences && typeof activeProvider.preferences === 'object'
+        ? activeProvider.preferences
         : {};
 
       // 解析子渠道
-      const rawSubChannels = Array.isArray(provider.sub_channels) ? provider.sub_channels : [];
+      const rawSubChannels = Array.isArray(activeProvider.sub_channels) ? activeProvider.sub_channels : [];
       const subChannels: SubChannelFormData[] = rawSubChannels.map((sub: any) => {
         const subRawModels = Array.isArray(sub.model) ? sub.model : Array.isArray(sub.models) ? sub.models : [];
         const subModels: string[] = [];
@@ -593,25 +1321,27 @@ export default function Channels() {
           enabled: sub.enabled,
           remark: sub.remark || '',
           base_url: sub.base_url || '',
+          token_url: sub.token_url || '',
           model_prefix: sub.model_prefix || '',
           _collapsed: true,
         };
       });
 
       setFormData({
-        provider: provider.provider || provider.name || '',
-        remark: provider.remark || '',
-        engine: provider.engine || '',
-        base_url: provider.base_url || '',
+        provider: activeProvider.provider || activeProvider.name || '',
+        remark: activeProvider.remark || '',
+        engine: activeProvider.engine || '',
+        base_url: activeProvider.base_url || '',
+        token_url: activeProvider.token_url || '',
         api_keys: parsedKeys,
-        model_prefix: provider.model_prefix || '',
-        enabled: provider.enabled !== false,
+        model_prefix: activeProvider.model_prefix || '',
+        enabled: activeProvider.enabled !== false,
         groups,
         models,
         mappings,
         preferences: {
           ...basePreferences,
-          weight: basePreferences.weight ?? provider.weight ?? 10,
+          weight: basePreferences.weight ?? activeProvider.weight ?? 10,
           cooldown_period: basePreferences.cooldown_period ?? 3,
           api_key_schedule_algorithm: basePreferences.api_key_schedule_algorithm || 'round_robin',
           proxy: basePreferences.proxy || '',
@@ -634,6 +1364,7 @@ export default function Channels() {
         remark: '',
         engine: channelTypes.length > 0 ? channelTypes[0].id : '',
         base_url: '',
+        token_url: '',
         api_keys: [],
         model_prefix: '',
         enabled: true,
@@ -647,6 +1378,7 @@ export default function Channels() {
         sub_channels: [],
       });
     }
+    applyChannelModalScrollLock();
     setIsModalOpen(true);
   };
 
@@ -671,9 +1403,12 @@ export default function Channels() {
 
   // ── 查询所有 Key 余额 ──
   const queryAllBalances = async (silent = false) => {
-    if (!formData || !formData.base_url) return;
+    // 修改原因：OAuth 渠道的余额查询不依赖 Base URL 和 preferences.balance，而是由后端 OAuthManager 按账号标识查询。
+    // 修改方式：仅普通渠道继续强制要求 base_url 和 balance 配置，OAuth 渠道直接进入 active key 查询。
+    // 目的：让 Codex 等 OAuth 渠道的余额按钮可以点击并刷新 quota。
+    if (!formData || (!isOAuthEngine && !formData.base_url)) return;
     const balanceCfg = formData.preferences?.balance;
-    if (!balanceCfg) { if (!silent) toastWarning('该渠道未配置余额查询（preferences.balance）'); return; }
+    // balanceCfg 为空时后端会尝试根据 base_url 自动匹配模板，不再前端拦截
 
     const activeKeys = formData.api_keys.filter(k => k.key.trim() && !k.disabled);
     if (activeKeys.length === 0) { if (!silent) toastError('没有可用的 Key'); return; }
@@ -692,6 +1427,10 @@ export default function Channels() {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
             body: JSON.stringify({
+              // 修改原因：OAuth 余额查询后端需要 provider name 作为 channel_id 定位分层 oauth_state。
+              // 修改方式：余额请求随当前表单渠道名一起提交，普通渠道会忽略该字段。
+              // 目的：避免同邮箱账号在不同 OAuth 渠道之间串读 quota。
+              provider: formData.provider,
               engine: formData.engine,
               base_url: formData.base_url,
               api_key: keyObj.key,
@@ -699,7 +1438,42 @@ export default function Channels() {
             }),
           });
           const data = await res.json().catch(() => ({ supported: false, error: '响应解析失败' }));
-          results[keyObj.key] = data;
+          let resultForKey: BalanceResult = isOAuthEngine ? (data?.results?.[keyObj.key] || data) : data;
+          // 修改原因：balance_enricher 返回的 tier 字段需要随当前 Key 的余额状态一起保存，后续行渲染才能读取。
+          // 修改方式：在写入 balanceResults 前把 tier 归一化为字符串，其余余额字段保持后端原样。
+          // 目的：避免普通渠道的 Tier 标签因类型不明确而丢失。
+          if (resultForKey?.tier != null) {
+            resultForKey = { ...resultForKey, tier: String(resultForKey.tier) };
+          }
+          results[keyObj.key] = resultForKey;
+          if (isOAuthEngine) {
+            // 修改原因：OAuth Key 行不读取普通 balanceResults 标签，而是从 oauthAccounts 中渲染双弧 quota。
+            // 修改方式：余额按钮拿到 OAuth quota 后同步写回对应账号状态，保留旧账号字段并清除加载标记。
+            // 目的：用户手动点击余额后可以立即看到 OAuth 配额刷新结果。
+            const hasQuota = resultForKey?.quota_5h != null || resultForKey?.quota_7d != null;
+            setOauthAccounts(prev => {
+              const current = prev[keyObj.key];
+              if (!hasQuota && !current) return prev;
+              const { _quota_loading: _unusedLoading, ...accountWithoutLoading } = current || {};
+              return {
+                ...prev,
+                [keyObj.key]: {
+                  status: accountWithoutLoading.status || 'active',
+                  ...accountWithoutLoading,
+                  ...(resultForKey?.quota_5h != null ? { quota_5h: resultForKey.quota_5h } : {}),
+                  ...(resultForKey?.quota_7d != null ? { quota_7d: resultForKey.quota_7d } : {}),
+                  ...(resultForKey?.raw ? { quota_raw: resultForKey.raw } : {}),
+                  ...(resultForKey?.extra_usage_enabled ? {
+                    extra_usage_enabled: true,
+                    extra_usage_limit: resultForKey.extra_usage_limit,
+                    extra_usage_used: resultForKey.extra_usage_used,
+                    extra_usage_utilization: resultForKey.extra_usage_utilization,
+                  } : {}),
+                  _quota_unavailable: !hasQuota && !resultForKey?.extra_usage_enabled,
+                },
+              };
+            });
+          }
         } catch (e: any) {
           results[keyObj.key] = { supported: false, error: e.message || '网络错误' };
         }
@@ -721,6 +1495,201 @@ export default function Channels() {
     updateFormData('api_keys', newKeys);
   };
 
+  const handleOAuthKeyFocus = (idx: number, keyStr: string) => {
+    // 修改原因：rename API 需要旧 key_id，而受控输入框在 onChange 后只保留新值。
+    // 修改方式：输入框获得焦点时按行下标记录旧值，并继续更新当前聚焦行。
+    // 目的：onBlur 时可以准确判断是否需要同步 oauth_state.json。
+    oauthKeyFocusSnapshotRef.current[idx] = keyStr;
+    setFocusedKeyIdx(idx);
+  };
+
+  const handleOAuthKeyBlur = async (idx: number, newValue: string) => {
+    // 修改原因：用户改 OAuth 账号标识符时，api.yaml 和 oauth_state.json 必须同时迁移到新 key。
+    // 修改方式：对已存在于 oauthAccounts 的旧 key 调用后端 rename；失败时恢复输入框旧值并提示错误。
+    // 目的：避免保存渠道后新 key 无法解析 access_token。
+    setFocusedKeyIdx(null);
+    const oldValue = (oauthKeyFocusSnapshotRef.current[idx] || '').trim();
+    delete oauthKeyFocusSnapshotRef.current[idx];
+    const nextValue = newValue.trim();
+    const providerName = (formData?.provider || '').trim();
+    if (!isOAuthEngine || !providerName || !oldValue || !nextValue || oldValue === nextValue || !oauthAccounts[oldValue]) return;
+
+    try {
+      const res = await apiFetch(`/v1/oauth/accounts/${encodeURIComponent(oldValue)}/rename`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ provider: providerName, new_key_id: nextValue }),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        updateKey(idx, oldValue);
+        toastError(fmtErr(err, res.status), 'OAuth 账号重命名失败');
+        return;
+      }
+      setOauthAccounts(prev => {
+        const account = prev[oldValue];
+        if (!account) return prev;
+        const next = { ...prev };
+        delete next[oldValue];
+        next[nextValue] = account;
+        return next;
+      });
+      refreshOAuthAccounts();
+    } catch (err: any) {
+      updateKey(idx, oldValue);
+      toastError(err?.message || '网络错误', 'OAuth 账号重命名失败');
+    }
+  };
+
+  const openImportModal = (idx: number) => {
+    // 修改原因：OAuth 空 Key 行需要一个明确入口接收 refresh_token，而不是把 token 直接保存进 api_keys。
+    // 修改方式：记录当前行下标并清空上一次输入，随后由弹窗提交到 /v1/oauth/import。
+    // 目的：让 api_keys 中最终只保存邮箱或后端返回的账号标识。
+    setImportModalIdx(idx);
+    setImportToken('');
+  };
+
+  const doImport = async () => {
+    if (!importToken.trim() || importModalIdx === null || !formData) return;
+    setImporting(true);
+    try {
+      const keyId = `account_${Date.now()}`;
+      const providerName = formData.provider.trim();
+      if (!providerName) {
+        toastError('渠道名为空，无法导入 OAuth 凭证');
+        return;
+      }
+      const res = await apiFetch('/v1/oauth/import', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        // 修改原因：后端 OAuth 导入已按 provider name 分层保存，body 必须携带当前渠道名。
+        // 修改方式：在原 key_id/type/refresh_token 外增加 provider 字段。
+        // 目的：导入同邮箱账号时只写入当前 OAuth 渠道。
+        body: JSON.stringify({ provider: providerName, key_id: keyId, type: formData.engine, refresh_token: importToken.trim() }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        updateKey(importModalIdx, data.key_id || keyId);
+        setOauthAccounts(prev => ({ ...prev, [data.key_id || keyId]: prev[data.key_id || keyId] || { type: formData.engine, status: 'active' } }));
+        setImportModalIdx(null);
+        setImportToken('');
+      } else {
+        const err = await res.json().catch(() => ({}));
+        toastError(fmtErr(err, res.status), '导入失败');
+      }
+    } finally {
+      setImporting(false);
+    }
+  };
+
+  const startOAuthLogin = async (idx: number) => {
+    // 修改原因：后端现在会按 provider 返回 auto 或 manual 登录模式，前端不能再用单一的弹窗地址轮询流程。
+    // 修改方式：authorize 成功后读取 mode；manual 显示粘贴弹窗，auto 监听 callback 成功页的 postMessage。
+    // 目的：同时支持 Codex 固定 localhost 回调和 Antigravity/Gemini CLI 等可自定义回调的 OAuth provider。
+    if (!formData) return;
+    const providerName = formData.provider.trim();
+    if (!providerName) {
+      toastError('渠道名为空，无法发起 OAuth 登录');
+      return;
+    }
+    try {
+      const res = await apiFetch(`/v1/oauth/authorize?type=${encodeURIComponent(formData.engine)}&provider=${encodeURIComponent(providerName)}&origin=${encodeURIComponent(window.location.origin)}`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        toastError(fmtErr(err, res.status), '发起登录失败');
+        return;
+      }
+      const { auth_url, state, mode } = await res.json();
+      const authWindow = window.open(auth_url, '_blank', 'width=600,height=700');
+      if (!authWindow) {
+        toastError('无法打开弹出窗口，请允许弹窗后重试');
+        return;
+      }
+
+      if (mode === 'manual') {
+        // 修改原因：manual 模式的 provider 会跳转到 localhost 失败页，前端无法依赖跨窗口读取地址栏。
+        // 修改方式：打开授权窗口后记录本次 state，并显示独立粘贴弹窗让用户提交完整回调 URL。
+        // 目的：让 Codex 这类固定 localhost 回调的 OAuth 登录稳定完成 token 交换。
+        setOauthManualState({ idx, state, provider: providerName });
+        setManualUrl('');
+        return;
+      }
+
+      const handler = (event: MessageEvent) => {
+        // 修改原因：auto 模式由后端成功页通过 postMessage 把 key_id 传回管理前端。
+        // 修改方式：只接受 oauth_callback_success 消息，并校验 state 与本次 authorize 返回值一致。
+        // 目的：避免其他窗口消息误触发当前 Key 行更新。
+        if (event.data?.type !== 'oauth_callback_success') return;
+        if (event.data?.state && event.data.state !== state) return;
+        if (event.data?.provider && event.data.provider !== providerName) return;
+        window.removeEventListener('message', handler);
+        const keyId = event.data.key_id;
+        if (keyId) {
+          updateKey(idx, keyId);
+        }
+        refreshOAuthAccounts();
+        if (!authWindow.closed) {
+          authWindow.close();
+        }
+      };
+      window.addEventListener('message', handler);
+      window.setTimeout(() => {
+        // 修改原因：后端 pending flow 只保存 5 分钟，过期后继续监听会造成误导。
+        // 修改方式：5 分钟后移除本次 postMessage 监听器。
+        // 目的：让前端生命周期与后端授权状态有效期保持一致。
+        window.removeEventListener('message', handler);
+      }, 300000);
+    } catch (e) {
+      toastError(e instanceof Error ? e.message : String(e), '登录出错');
+    }
+  };
+
+  const doManualExchange = async () => {
+    // 修改原因：manual OAuth 模式需要用户粘贴 localhost 回调 URL 后再由前端提交 code。
+    // 修改方式：解析完整 URL 中的 authorization code，校验 state 后调用 /v1/oauth/exchange。
+    // 目的：取代 prompt 和跨窗口 location 轮询，减少浏览器安全策略对登录流程的影响。
+    if (!oauthManualState || !manualUrl.trim()) return;
+    setExchanging(true);
+    try {
+      const url = new URL(manualUrl.trim());
+      const code = url.searchParams.get('code');
+      const callbackState = url.searchParams.get('state');
+      if (!code) {
+        toastError('URL 中未找到 authorization code');
+        return;
+      }
+      if (callbackState && callbackState !== oauthManualState.state) {
+        toastError('state 不匹配，可能不是本次登录的回调');
+        return;
+      }
+
+      const res = await apiFetch('/v1/oauth/exchange', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        // 修改原因：manual exchange 发生在 authorize 之后，后端需要 provider 验证 state 属于当前渠道。
+        // 修改方式：oauthManualState 保存发起登录时的 provider，并随 code/state 一起提交。
+        // 目的：避免用户粘贴其他渠道的回调 URL 后写入错误 OAuth state 分组。
+        body: JSON.stringify({ provider: oauthManualState.provider, code, state: oauthManualState.state }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        updateKey(oauthManualState.idx, data.key_id || '');
+        await refreshOAuthAccounts();
+        setOauthManualState(null);
+        setManualUrl('');
+      } else {
+        const err = await res.json().catch(() => ({}));
+        toastError(fmtErr(err, res.status), 'Token 交换失败');
+      }
+    } catch (e) {
+      toastError(e instanceof Error ? e.message : String(e), 'URL 解析失败');
+    } finally {
+      setExchanging(false);
+    }
+  };
+
   const toggleKeyDisabled = (idx: number) => {
     if (!formData) return;
     const newKeys = [...formData.api_keys];
@@ -728,8 +1697,42 @@ export default function Channels() {
     updateFormData('api_keys', newKeys);
   };
 
-  const deleteKey = (idx: number) => {
+  const deleteKey = async (idx: number) => {
     if (!formData) return;
+    const keyValue = (formData.api_keys[idx]?.key || '').trim();
+    const providerName = formData.provider.trim();
+    if (isOAuthEngine && keyValue && providerName && oauthAccounts[keyValue]) {
+      // 修改原因：OAuth 账号删除会立即调用后端清除 refresh_token，和普通表单删行不同，误触后无法恢复。
+      // 修改方式：在 DELETE 请求前使用 window.confirm 展示账号标识和不可逆提醒，用户取消时直接返回。
+      // 目的：让管理员确认风险后才执行即时删除，避免误删账号 token。
+      const confirmOAuthDelete = window.confirm(
+        `确定要删除 OAuth 账号 ${keyValue} 吗？\n\n注意：这是即时生效的不可逆操作。删除后 token 将无法恢复，需要重新导入。`,
+      );
+      if (!confirmOAuthDelete) return;
+
+      try {
+        // 修改原因：OAuth Key 删除不只要移出 api.yaml 表单，还要清理当前渠道下的 oauth_state 凭据。
+        // 修改方式：删除表单行前调用 DELETE /v1/oauth/accounts/{key}?provider=当前渠道名，失败则保留表单行。
+        // 目的：避免保存渠道后残留无用 refresh_token，也避免删除其他渠道同邮箱凭据。
+        const res = await apiFetch(`/v1/oauth/accounts/${encodeURIComponent(keyValue)}?provider=${encodeURIComponent(providerName)}`, {
+          method: 'DELETE',
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          toastError(fmtErr(err, res.status), 'OAuth 账号删除失败');
+          return;
+        }
+        setOauthAccounts(prev => {
+          const next = { ...prev };
+          delete next[keyValue];
+          return next;
+        });
+      } catch (err: any) {
+        toastError(err?.message || '网络错误', 'OAuth 账号删除失败');
+        return;
+      }
+    }
     updateFormData('api_keys', formData.api_keys.filter((_, i) => i !== idx));
   };
 
@@ -755,6 +1758,41 @@ export default function Channels() {
     if (!activeKeys.length) return;
     navigator.clipboard.writeText(activeKeys.join('\n'));
     toastSuccess('已复制所有有效密钥');
+  };
+
+  const exportOAuthCredentials = async () => {
+    if (!formData) return;
+    const providerName = formData.provider.trim();
+    if (!providerName) {
+      toastError('渠道名为空，无法导出 OAuth 凭证');
+      return;
+    }
+    try {
+      // 修改原因：OAuth 凭据导出是显式备份操作，后端要求 provider query 来限定导出范围。
+      // 修改方式：调用 /v1/oauth/export?provider=当前渠道名，拿到 JSON 后生成本地下载文件。
+      // 目的：让管理员可迁移指定渠道的 refresh_token，同时不把其他渠道凭据混入导出文件。
+      const res = await apiFetch(`/v1/oauth/export?provider=${encodeURIComponent(providerName)}`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        toastError(fmtErr(err, res.status), '导出失败');
+        return;
+      }
+      const data = await res.json();
+      const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `oauth-${providerName.replace(/[^a-zA-Z0-9._-]+/g, '_')}.json`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
+      toastSuccess('OAuth 凭证导出已开始');
+    } catch (err: any) {
+      toastError(err?.message || '网络错误', '导出失败');
+    }
   };
 
   const clearAllKeys = () => {
@@ -936,46 +1974,61 @@ export default function Channels() {
 
   const handleDeleteProvider = async (idx: number) => {
     const provider = providers[idx];
-    const name = provider?.provider || `渠道 ${idx + 1}`;
+    const providerId = String(provider?.provider || '').trim();
+    const name = providerId || `渠道 ${idx + 1}`;
+    if (!providerId) {
+      toastError('删除失败：渠道名为空');
+      return;
+    }
     if (!confirm(`确定要删除渠道 "${name}" 吗？此操作不可撤销。`)) return;
 
-    const newProviders = providers.filter((_, i) => i !== idx);
     try {
-      const res = await apiFetch('/v1/api_config/update', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-        body: JSON.stringify({ providers: newProviders }),
+      // 修改原因：删除主渠道不能再提交删除后的完整 providers 数组，否则会覆盖其他浏览器的新配置。
+      // 修改方式：调用 DELETE /v1/providers/{provider_id}，成功后统一 refreshProviders 获取后端最新列表。
+      // 目的：让删除操作只影响一个渠道，并保留并发修改。
+      const res = await apiFetch(buildProviderApiPath(providerId), {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${token}` },
       });
       if (res.ok) {
-        setProviders(newProviders);
+        await refreshProviders();
         toastError(`已删除渠道 "${name}"`);
       } else {
-        toastError('删除失败');
+        const err = await res.json().catch(() => ({}));
+        toastError(fmtErr(err, res.status), '删除失败');
       }
-    } catch {
-      toastError('网络错误');
+    } catch (err: any) {
+      toastError(err?.message || '网络错误');
     }
   };
 
   const handleToggleProvider = async (idx: number) => {
     const provider = providers[idx];
+    const providerId = String(provider?.provider || '').trim();
+    if (!providerId) {
+      toastError('操作失败：渠道名为空');
+      return;
+    }
     const newEnabled = provider.enabled === false ? true : false;
-    const newProviders = [...providers];
-    newProviders[idx] = { ...provider, enabled: newEnabled };
+    const updatedProvider = { ...provider, enabled: newEnabled };
 
     try {
-      const res = await apiFetch('/v1/api_config/update', {
-        method: 'POST',
+      // 修改原因：启用或禁用只改一个 provider，继续全量提交会覆盖其他设备上的渠道改动。
+      // 修改方式：把修改 enabled 后的 provider 对象 PUT 到对应 provider_id，再刷新完整列表。
+      // 目的：保持开关操作的影响范围仅限当前渠道。
+      const res = await apiFetch(buildProviderApiPath(providerId), {
+        method: 'PUT',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-        body: JSON.stringify({ providers: newProviders }),
+        body: JSON.stringify(updatedProvider),
       });
       if (res.ok) {
-        setProviders(newProviders);
+        await refreshSingleProvider(providerId);
       } else {
-        toastError('操作失败');
+        const err = await res.json().catch(() => ({}));
+        toastError(fmtErr(err, res.status), '操作失败');
       }
-    } catch {
-      toastError('网络错误');
+    } catch (err: any) {
+      toastError(err?.message || '网络错误');
     }
   };
 
@@ -990,58 +2043,106 @@ export default function Channels() {
   // ── 子渠道操作 ──
   const handleToggleSubChannel = async (parentIdx: number, subIdx: number) => {
     const parent = providers[parentIdx];
+    const providerId = String(parent.provider || '').trim();
+    if (!providerId) {
+      toastError('操作失败：主渠道名为空');
+      return;
+    }
     const subs = [...(parent.sub_channels || [])];
     subs[subIdx] = { ...subs[subIdx], enabled: subs[subIdx].enabled === false ? true : false };
-    const newProviders = [...providers];
-    newProviders[parentIdx] = { ...parent, sub_channels: subs };
+    const updatedParent = { ...parent, sub_channels: subs };
     try {
-      const res = await apiFetch('/v1/api_config/update', {
-        method: 'POST',
+      // 修改原因：子渠道开关实际只修改所属主渠道的 sub_channels 字段，全量 POST 会覆盖其他渠道的并发改动。
+      // 修改方式：构造更新后的主渠道对象，并通过 PUT /v1/providers/{provider_id} 保存单个主渠道。
+      // 目的：让子渠道启用状态变更只影响所属主渠道，成功后再从后端刷新最新列表。
+      const res = await apiFetch(buildProviderApiPath(providerId), {
+        method: 'PUT',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-        body: JSON.stringify({ providers: newProviders }),
+        body: JSON.stringify(updatedParent),
       });
-      if (res.ok) setProviders(newProviders);
+      if (res.ok) await refreshSingleProvider(providerId);
       else toastError('操作失败');
     } catch { toastError('网络错误'); }
   };
 
   const handleDeleteSubChannel = async (parentIdx: number, subIdx: number) => {
     const parent = providers[parentIdx];
+    const providerId = String(parent.provider || '').trim();
+    if (!providerId) {
+      toastError('删除失败：主渠道名为空');
+      return;
+    }
     const sub = (parent.sub_channels || [])[subIdx];
     const name = sub?.remark || sub?.engine || `子渠道 ${subIdx + 1}`;
     if (!confirm(`确定要删除子渠道 "${name}" 吗？`)) return;
     const subs = (parent.sub_channels || []).filter((_: any, i: number) => i !== subIdx);
-    const newProviders = [...providers];
-    newProviders[parentIdx] = { ...parent, sub_channels: subs.length > 0 ? subs : undefined };
+    const updatedParent = { ...parent, sub_channels: subs.length > 0 ? subs : undefined };
     try {
-      const res = await apiFetch('/v1/api_config/update', {
-        method: 'POST',
+      // 修改原因：删除子渠道同样只改所属主渠道的 sub_channels 字段，不能再把完整 providers 数组写回后端。
+      // 修改方式：把删除后的主渠道对象 PUT 到单个 provider 路径，并保留空数组清理为 undefined 的旧行为。
+      // 目的：降低子渠道删除操作的写入范围，避免覆盖其他渠道的新配置。
+      const res = await apiFetch(buildProviderApiPath(providerId), {
+        method: 'PUT',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-        body: JSON.stringify({ providers: newProviders }),
+        body: JSON.stringify(updatedParent),
       });
-      if (res.ok) { setProviders(newProviders); }
+      if (res.ok) { await refreshSingleProvider(providerId); }
       else toastError('删除失败');
     } catch { toastError('网络错误'); }
   };
 
-  const openSubChannelEdit = (parentIdx: number, subIdx: number) => {
+  const openSubChannelEdit = async (parentIdx: number, subIdx: number) => {
     const parent = providers[parentIdx];
-    const sub = (parent.sub_channels || [])[subIdx];
-    if (!sub) return;
+    const providerId = String(parent?.provider || '').trim();
+    if (!parent || !providerId) {
+      toastError('编辑失败：主渠道名为空');
+      return;
+    }
+
+    // 修改原因：子渠道编辑保存会把子渠道写回所属主渠道，如果这里继续使用旧 parent，仍可能覆盖其他设备刚改过的主渠道字段。
+    // 修改方式：先按主渠道 provider id 请求最新主渠道，成功后同步替换 providers 中对应项，再从 freshParent 取子渠道填表。
+    // 目的：让子渠道编辑和主渠道编辑一样，以后端最新配置作为表单初始化来源。
+    let freshParent = parent;
+    try {
+      const res = await apiFetch(buildProviderApiPath(providerId), {
+        method: 'GET',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (res.ok) {
+        const data = await res.json();
+        if (data?.provider) {
+          freshParent = data.provider;
+          setProviders(prev => prev.map((item, idx) => idx === parentIdx ? freshParent : item));
+        } else {
+          toastWarning('获取主渠道最新数据失败，已使用页面缓存继续编辑');
+        }
+      } else {
+        toastWarning('获取主渠道最新数据失败，已使用页面缓存继续编辑');
+      }
+    } catch {
+      toastWarning('获取主渠道最新数据失败，已使用页面缓存继续编辑');
+    }
+
+    const sub = (freshParent.sub_channels || [])[subIdx];
+    if (!sub) {
+      toastError('编辑失败：子渠道不存在或已被删除');
+      return;
+    }
     // 构造一个虚拟 provider 给 openModal，合并主渠道的 key 等
     setEditingSubChannel({ parentIdx, subIdx });
-    openModal({
-      provider: `${parent.provider}:${sub.engine || 'sub'}`,
+    await openModal({
+      provider: `${freshParent.provider}:${sub.engine || 'sub'}`,
       engine: sub.engine || '',
-      base_url: sub.base_url || parent.base_url || '',
-      api: parent.api,
+      base_url: sub.base_url || freshParent.base_url || '',
+      token_url: sub.token_url || freshParent.token_url || '',
+      api: freshParent.api,
       model: sub.model || sub.models || [],
-      model_prefix: sub.model_prefix || parent.model_prefix || '',
+      model_prefix: sub.model_prefix || freshParent.model_prefix || '',
       enabled: sub.enabled !== false,
       remark: sub.remark || '',
-      groups: parent.groups || ['default'],
+      groups: freshParent.groups || ['default'],
       preferences: {
-        ...(parent.preferences || {}),
+        ...(freshParent.preferences || {}),
         ...(sub.preferences || {}),
       },
       sub_channels: [], // 子渠道不能再分子渠道
@@ -1057,6 +2158,7 @@ export default function Channels() {
       provider: `${parent.provider}:${sub.engine || 'sub'}`,
       engine: sub.engine || '',
       base_url: sub.base_url || parent.base_url || '',
+      token_url: sub.token_url || parent.token_url || '',
       api: parent.api,
       model: sub.model || sub.models || [],
       model_prefix: sub.model_prefix || parent.model_prefix || '',
@@ -1066,32 +2168,40 @@ export default function Channels() {
     };
   };
 
-  // 排序函数
-  const sortByWeight = (list: any[]) => {
-    return [...list].sort((a, b) => {
-      const weightA = a.preferences?.weight ?? a.weight ?? 0;
-      const weightB = b.preferences?.weight ?? b.weight ?? 0;
-      return weightB - weightA;
-    });
-  };
+  // 修改原因：历史代码多处调用 sortByWeight，本次只把实现统一委托给组件外的纯 helper。
+  // 修改方式：保留原函数名作为局部别名，减少保存子渠道等无关逻辑的改动范围。
+  // 目的：在引入 refreshProviders 的同时保持既有调用点稳定。
+  const sortByWeight = sortProvidersByWeight;
 
   const handleUpdateWeight = async (idx: number, newWeight: number) => {
-    const newProviders = [...providers];
-    if (!newProviders[idx].preferences) newProviders[idx].preferences = {};
-    newProviders[idx].preferences.weight = newWeight;
+    const provider = providers[idx];
+    const providerId = String(provider?.provider || '').trim();
+    if (!providerId) {
+      toastError('权重更新失败：渠道名为空');
+      return;
+    }
+    const updatedProvider = {
+      ...provider,
+      preferences: { ...(provider.preferences || {}), weight: newWeight },
+    };
 
     try {
-      const res = await apiFetch('/v1/api_config/update', {
-        method: 'POST',
+      // 修改原因：权重更新只改变当前 provider.preferences.weight，全量保存会覆盖并发修改。
+      // 修改方式：PUT 单个 provider 后调用 refreshProviders，让后端最新排序结果回到页面。
+      // 目的：保持权重编辑的局部性，同时继续按权重降序展示。
+      const res = await apiFetch(buildProviderApiPath(providerId), {
+        method: 'PUT',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-        body: JSON.stringify({ providers: newProviders }),
+        body: JSON.stringify(updatedProvider),
       });
       if (res.ok) {
-        // 更新后重新排序
-        setProviders(sortByWeight(newProviders));
+        await refreshSingleProvider(providerId);
+      } else {
+        const err = await res.json().catch(() => ({}));
+        toastError(fmtErr(err, res.status), '权重更新失败');
       }
-    } catch {
-      console.error('Failed to update weight');
+    } catch (err: any) {
+      toastError(err?.message || '权重更新失败');
     }
   };
 
@@ -1533,6 +2643,19 @@ export default function Channels() {
     });
   };
 
+  const swapVirtualEditorNode = (idx: number, direction: -1 | 1) => {
+    // 修改原因：触摸屏不会触发 HTML5 原生 Drag and Drop 事件，手机端需要不依赖拖拽的排序入口。
+    // 修改方式：根据上移或下移方向计算相邻目标索引，并在本地 chain 草稿中交换两个节点。
+    // 目的：在保留桌面拖拽排序的同时，让移动端用户也能调整虚拟模型链条优先级。
+    updateVirtualEditorChainDraft(prev => {
+      const targetIdx = idx + direction;
+      if (idx < 0 || idx >= prev.length || targetIdx < 0 || targetIdx >= prev.length) return prev;
+      const next = [...prev];
+      [next[idx], next[targetIdx]] = [next[targetIdx], next[idx]];
+      return next;
+    });
+  };
+
   const appendVirtualEditorNodeByType = () => {
     // 修改原因：移动端或不使用拖拽的场景仍需要显式添加节点入口。
     // 修改方式：读取当前虚拟模型的添加类型状态，向抽屉 chain 追加空节点。
@@ -1620,9 +2743,14 @@ export default function Channels() {
   const buildProviderSnapshotForTest = (): any => {
     if (!formData) return null;
 
-    const serializedKeys = formData.api_keys
-      .map(k => k.disabled ? `!${k.key.trim()}` : k.key.trim())
-      .filter(Boolean);
+    const serializedKeys: (string | Record<string, string>)[] = formData.api_keys
+      .map(k => {
+        const raw = k.disabled ? `!${k.key.trim()}` : k.key.trim();
+        if (!raw) return null;
+        if (k.label) return { [raw]: k.label } as Record<string, string>;
+        return raw;
+      })
+      .filter((x): x is string | Record<string, string> => x !== null);
     const finalApi = serializedKeys.length === 0 ? "" : serializedKeys.length === 1 ? serializedKeys[0] : serializedKeys;
 
     const finalModels: any[] = [...formData.models];
@@ -1651,11 +2779,16 @@ export default function Channels() {
     // 修改方式：构造预览/测试 payload 时同步归一化该字段。
     // 目的：避免测试渠道时使用与正式保存不同的路由池共享状态。
     const normalizedPoolSharing = formData.model_prefix.trim() ? !!formData.preferences.pool_sharing : false;
+    const serializedPreferences = serializeChannelPreferences(formData.preferences);
 
     return {
       provider: formData.provider,
       remark: formData.remark || undefined,
       base_url: formData.base_url,
+      // 修改原因：OAuth token endpoint 已独立为 token_url，测试快照必须与正式保存 payload 保持相同字段语义。
+      // 修改方式：直接提交 formData.token_url，包括空字符串，避免 JSON.stringify 删除 undefined 字段。
+      // 目的：确保测试弹窗、保存请求和回显链路都能表达用户填写或清空 token_url 的真实状态。
+      token_url: formData.token_url,
       model_prefix: formData.model_prefix || undefined,
       api: finalApi,
       model: finalModels,
@@ -1663,7 +2796,7 @@ export default function Channels() {
       enabled: formData.enabled,
       groups: formData.groups,
       preferences: {
-        ...formData.preferences,
+        ...serializedPreferences,
         pool_sharing: normalizedPoolSharing,
         headers: headersObj,
         post_body_parameter_overrides: overridesObj,
@@ -1680,14 +2813,16 @@ export default function Channels() {
 
   const getProviderModelNameListForUi = (): string[] => {
     if (!formData) return [];
+    const prefix = (formData as any).model_prefix || '';
     const aliasMap = getAliasMap();
     const names: string[] = [];
     formData.models.forEach(upstream => {
       const alias = aliasMap.get(upstream);
-      names.push(alias || upstream);
+      const name = alias || upstream;
+      names.push(prefix && name !== '*' ? `${prefix}${name}` : name);
     });
     formData.mappings.forEach(m => {
-      if (m.from) names.push(m.from);
+      if (m.from) names.push(prefix ? `${prefix}${m.from}` : m.from);
     });
     return Array.from(new Set(names.map(s => String(s || '').trim()).filter(Boolean)));
   };
@@ -1708,9 +2843,14 @@ export default function Channels() {
       return;
     }
 
-    const serializedKeys = formData.api_keys
-      .map(k => k.disabled ? `!${k.key.trim()}` : k.key.trim())
-      .filter(Boolean);
+    const serializedKeys: (string | Record<string, string>)[] = formData.api_keys
+      .map(k => {
+        const raw = k.disabled ? `!${k.key.trim()}` : k.key.trim();
+        if (!raw) return null;
+        if (k.label) return { [raw]: k.label } as Record<string, string>;
+        return raw;
+      })
+      .filter((x): x is string | Record<string, string> => x !== null);
     const finalApi = serializedKeys.length === 0 ? "" : serializedKeys.length === 1 ? serializedKeys[0] : serializedKeys;
 
     const finalModels: any[] = [...formData.models];
@@ -1771,6 +2911,7 @@ export default function Channels() {
     // 修改方式：保存前统一计算 normalizedPoolSharing，并覆盖 preferences 中的同名字段。
     // 目的：保证后端收到的配置不会出现无前缀但共享路由池开启的状态。
     const normalizedPoolSharing = formData.model_prefix.trim() ? !!formData.preferences.pool_sharing : false;
+    const serializedPreferences = serializeChannelPreferences(formData.preferences);
 
     // 序列化子渠道
     const serializedSubChannels = formData.sub_channels
@@ -1785,10 +2926,12 @@ export default function Channels() {
           model: subModels.length > 0 ? subModels : undefined,
         };
         if (sub.base_url) subObj.base_url = sub.base_url;
+        if (sub.token_url) subObj.token_url = sub.token_url;
         if (sub.model_prefix) subObj.model_prefix = sub.model_prefix;
         if (sub.remark) subObj.remark = sub.remark;
         if (sub.enabled === false) subObj.enabled = false;
-        if (Object.keys(sub.preferences).length > 0) subObj.preferences = sub.preferences;
+        const serializedSubPreferences = serializeChannelPreferences(sub.preferences || {});
+        if (Object.keys(serializedSubPreferences).length > 0) subObj.preferences = serializedSubPreferences;
         return subObj;
       });
 
@@ -1796,6 +2939,10 @@ export default function Channels() {
       provider: formData.provider,
       remark: formData.remark || undefined,
       base_url: formData.base_url,
+      // 修改原因：PUT /v1/providers/{id} 会整体替换 provider，不提交 token_url 会把已保存的值删除。
+      // 修改方式：正式保存 payload 始终携带 formData.token_url，空字符串也作为显式清空值发送。
+      // 目的：保证保存后 api.yaml、单渠道 GET 和再次打开编辑面板都能回显同一份 token_url。
+      token_url: formData.token_url,
       model_prefix: formData.model_prefix || undefined,
       api: finalApi,
       model: finalModels,
@@ -1803,7 +2950,7 @@ export default function Channels() {
       enabled: formData.enabled,
       groups: formData.groups,
       preferences: {
-        ...formData.preferences,
+        ...serializedPreferences,
         pool_sharing: normalizedPoolSharing,
         model_price: cleanedModelPrice,
         headers: headersObj,
@@ -1813,18 +2960,28 @@ export default function Channels() {
       sub_channels: serializedSubChannels.length > 0 ? serializedSubChannels : undefined,
     };
 
-    let newProviders: any[];
+    let newProviders: any[] | null = null;
+    let providerSavePath = '/v1/providers';
+    let providerSaveMethod: 'POST' | 'PUT' = 'POST';
+    let subChannelParentProviderId = '';
 
     if (editingSubChannel) {
-      // 子渠道模式：保存回 parent.sub_channels
+      // 修改原因：子渠道编辑保存只需要更新所属主渠道的 sub_channels 字段，不能继续全量提交 providers。
+      // 修改方式：先记录父渠道 provider_id，后续把更新后的父渠道对象 PUT 到单个 provider 路径。
+      // 目的：把子渠道编辑的写入范围限制在所属主渠道，避免覆盖其他渠道的并发变更。
       const { parentIdx, subIdx } = editingSubChannel;
       const parent = providers[parentIdx];
+      subChannelParentProviderId = String(parent.provider || '').trim();
+      if (!subChannelParentProviderId) {
+        toastError('保存失败：主渠道名为空');
+        return;
+      }
       const parentPrefs = parent.preferences || {};
 
       // 计算子渠道 diff preferences（只保存和主渠道不同的部分）
       const subPrefs: Record<string, any> = {};
       const mergedPrefs = {
-        ...formData.preferences,
+        ...serializedPreferences,
         pool_sharing: normalizedPoolSharing,
         model_price: cleanedModelPrice,
         headers: headersObj,
@@ -1843,6 +3000,7 @@ export default function Channels() {
         enabled: formData.enabled,
       };
       if (formData.base_url && formData.base_url !== (parent.base_url || '')) subObj.base_url = formData.base_url;
+      if (formData.token_url && formData.token_url !== (parent.token_url || '')) subObj.token_url = formData.token_url;
       if (formData.model_prefix && formData.model_prefix !== (parent.model_prefix || '')) subObj.model_prefix = formData.model_prefix;
       if (formData.remark) subObj.remark = formData.remark;
       if (Object.keys(subPrefs).length > 0) subObj.preferences = subPrefs;
@@ -1851,29 +3009,53 @@ export default function Channels() {
       subs[subIdx] = subObj;
       newProviders = [...providers];
       newProviders[parentIdx] = { ...parent, sub_channels: subs };
-    } else {
-      // 主渠道模式
-      newProviders = [...providers];
-      if (originalIndex !== null) newProviders[originalIndex] = targetProvider;
-      else newProviders.push(targetProvider);
+    } else if (originalIndex !== null) {
+      // 修改原因：编辑主渠道时路径必须使用打开弹窗时对应的原 provider_id，才能支持重命名渠道。
+      // 修改方式：从 originalIndex 读取当前列表中的原渠道名作为 PUT 路径，body 仍保存 targetProvider 的完整对象。
+      // 目的：只替换旧渠道对象，不把整个 providers 数组发回后端。
+      const originalProviderId = String(providers[originalIndex]?.provider || '').trim();
+      if (!originalProviderId) {
+        toastError('保存失败：找不到原渠道名');
+        return;
+      }
+      providerSavePath = buildProviderApiPath(originalProviderId);
+      providerSaveMethod = 'PUT';
     }
 
     try {
-      const res = await apiFetch('/v1/api_config/update', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-        body: JSON.stringify({ providers: newProviders }),
-      });
+      // 修改原因：主渠道和子渠道都已有可限定写入范围的单渠道 API，继续对子渠道全量保存会覆盖并发修改。
+      // 修改方式：子渠道编辑保存 PUT 更新后的父渠道对象；主渠道新增走 POST /v1/providers，编辑走 PUT /v1/providers/{provider_id}。
+      // 目的：所有渠道保存成功后统一 refreshProviders，以后端最新配置作为页面状态来源。
+      const res = editingSubChannel
+        ? await apiFetch(buildProviderApiPath(subChannelParentProviderId), {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+          body: JSON.stringify(newProviders![editingSubChannel.parentIdx]),
+        })
+        : await apiFetch(providerSavePath, {
+          method: providerSaveMethod,
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+          body: JSON.stringify(targetProvider),
+        });
 
       if (res.ok) {
-        setProviders(sortByWeight(newProviders));
+        // PUT 编辑走单渠道刷新；POST 新增走全量刷新（需要获取后端分配的完整对象）
+        const savedProviderId = editingSubChannel
+          ? subChannelParentProviderId
+          : (providerSaveMethod === 'PUT' ? String(providers[originalIndex!]?.provider || '').trim() : '');
+        if (savedProviderId) {
+          await refreshSingleProvider(savedProviderId);
+        } else {
+          await refreshProviders();
+        }
         setIsModalOpen(false);
         setEditingSubChannel(null);
       } else {
-        toastError("保存失败");
+        const err = await res.json().catch(() => ({}));
+        toastError(fmtErr(err, res.status), "保存失败");
       }
-    } catch {
-      toastError("网络错误");
+    } catch (err: any) {
+      toastError(err?.message || "网络错误");
     }
   };
 
@@ -1888,7 +3070,7 @@ export default function Channels() {
       <div className={`bg-card border border-border rounded-xl p-4 ${!isEnabled && 'opacity-60'}`}>
         <div className="flex items-start justify-between mb-3">
           <div className="flex items-center gap-3">
-            <ProviderLogo name={p.provider} engine={p.engine} />
+            <ProviderLogo name={p.provider} engine={p.engine} baseUrl={p.base_url} />
             <div>
               <div className={`font-medium ${isEnabled ? 'text-foreground' : 'text-muted-foreground'}`}>{p.provider}</div>
               <div className="text-xs text-muted-foreground font-mono">{p.engine || 'openai'}</div>
@@ -2006,6 +3188,20 @@ export default function Channels() {
           }
         });
       }
+    });
+    // 子渠道模型也纳入搜索
+    (p.sub_channels || []).forEach((sub: any) => {
+      const subModels = Array.isArray(sub.model) ? sub.model : [];
+      subModels.forEach((m: any) => {
+        if (typeof m === 'string') {
+          names.push(m);
+        } else if (typeof m === 'object' && m !== null) {
+          Object.entries(m).forEach(([upstream, alias]) => {
+            names.push(String(alias));
+            names.push(upstream);
+          });
+        }
+      });
     });
     return names;
   };
@@ -2211,7 +3407,7 @@ export default function Channels() {
                 className={`w-full h-11 rounded-lg border bg-background hover:bg-purple-500/10 flex items-center justify-center transition-colors ${isSubChannel ? 'border-cyan-500/30' : 'border-border'}`}
                 title={`添加渠道节点：${providerName}`}
               >
-                <ProviderLogo name={providerName} engine={provider?.engine} />
+                <ProviderLogo name={providerName} engine={provider?.engine} baseUrl={provider?.base_url || formData?.base_url} />
               </button>
               {isSubChannel && <span className="absolute -right-0.5 -top-0.5 w-2 h-2 rounded-full bg-cyan-500" />}
             </div>
@@ -2253,16 +3449,14 @@ export default function Channels() {
                   onClick={() => toggleVirtualProviderExpanded(providerName)}
                   className="flex-1 min-w-0 flex items-center gap-2 text-left"
                 >
-                  <ProviderLogo name={providerName} engine={provider?.engine} />
+                  <ProviderLogo name={providerName} engine={provider?.engine} baseUrl={provider?.base_url || formData?.base_url} />
                   <div className="min-w-0 flex-1">
-                    <div className="flex items-center gap-1.5 min-w-0">
+                    <div className="flex items-center gap-1 min-w-0">
                       <span className="text-xs font-medium text-foreground truncate">{providerName}</span>
-                      {isSubChannel && <span className="text-[10px] px-1 py-0.5 rounded bg-cyan-500/10 text-cyan-600 dark:text-cyan-400 flex-shrink-0">子</span>}
-                      <span className="text-[10px] px-1 py-0.5 rounded bg-muted text-muted-foreground font-mono flex-shrink-0">{provider?.engine || 'openai'}</span>
+                      {isSubChannel && <span className="text-[10px] px-1 rounded bg-cyan-500/10 text-cyan-600 dark:text-cyan-400 flex-shrink-0">子</span>}
+                      <span className="text-[10px] text-muted-foreground font-mono flex-shrink-0 ml-auto">{modelOptions.length}</span>
                     </div>
-                    <div className="text-[10px] text-muted-foreground mt-0.5 truncate">
-                      {isSubChannel && parentProviderName ? `${parentProviderName} · ` : ''}权重 {weight} · {modelOptions.length} 模型
-                    </div>
+                    {provider?.remark && <div className="text-[10px] text-muted-foreground truncate mt-0.5">{provider.remark}</div>}
                   </div>
                   <span className="text-[10px] text-muted-foreground flex-shrink-0">{isExpanded ? '收起' : '模型'}</span>
                 </button>
@@ -2678,7 +3872,11 @@ export default function Channels() {
                   // Key 统计
                   const apiRaw = Array.isArray(p.api) ? p.api : (typeof p.api === 'string' && p.api.trim() ? [p.api] : []);
                   const totalKeys = apiRaw.length;
-                  const configDisabledKeys = apiRaw.filter((k: any) => typeof k === 'string' && k.startsWith('!')).length;
+                  const configDisabledKeys = apiRaw.filter((k: any) => {
+                    if (typeof k === 'string') return k.startsWith('!');
+                    if (k && typeof k === 'object') { const key = Object.keys(k)[0] || ''; return key.startsWith('!'); }
+                    return false;
+                  }).length;
                   const rtStatus = runtimeKeyStatus[p.provider];
                   const rtDisabledCount = rtStatus?.auto_disabled?.length || 0;
                   const enabledKeys = totalKeys - configDisabledKeys;
@@ -2692,7 +3890,7 @@ export default function Channels() {
                   <tr key={idx} className={`transition-colors ${isInactive ? 'opacity-50' : ''} ${isEnabled ? 'hover:bg-muted/50' : 'bg-muted/30 opacity-60'}`}>
                     <td className="px-4 py-3">
                       <div className="flex items-center gap-2">
-                        <ProviderLogo name={p.provider} engine={p.engine} />
+                        <ProviderLogo name={p.provider} engine={p.engine} baseUrl={p.base_url} />
                         <div className="min-w-0">
                           <div className={`font-medium truncate ${isEnabled ? 'text-foreground' : 'text-muted-foreground'}`}>{p.provider}</div>
                           {p.remark && (
@@ -2957,7 +4155,7 @@ export default function Channels() {
                   {virtualModelsDirty && <div className="mt-3 text-xs text-amber-600 dark:text-amber-400 bg-amber-500/10 px-2 py-1 rounded-lg inline-flex">有未保存更改</div>}
                 </div>
 
-                <div className="flex-1 min-h-0 overflow-y-auto p-4 space-y-3">
+                <div className="flex-1 min-h-0 overflow-y-auto p-4 space-y-3" onClick={() => setFocusedKeyIdx(null)}>
                   <div
                     onDragOver={e => e.preventDefault()}
                     onDrop={e => handleVirtualEditorDrop(e)}
@@ -3007,9 +4205,34 @@ export default function Channels() {
                                       </div>
                                     )}
                                   </div>
-                                  <button onClick={() => updateVirtualEditorChainDraft(prev => prev.filter((_, removeIdx) => removeIdx !== idx))} className="p-1.5 text-red-600 dark:text-red-500 hover:bg-red-500/10 rounded-md transition-colors" title="删除节点">
-                                    <X className="w-4 h-4" />
-                                  </button>
+                                  {/* 修改原因：移动端无法使用 HTML5 原生拖拽排序，节点卡片需要额外提供触摸可点的排序控件。
+                                      修改方式：在删除按钮左侧加入上移和下移小按钮，禁用首尾无法移动的方向，并调用相邻交换函数。
+                                      目的：不移除桌面拖拽能力的前提下，保证手机端也能调整链条节点顺序。 */}
+                                  <div className="flex items-center gap-1 flex-shrink-0">
+                                    <button
+                                      type="button"
+                                      onClick={() => swapVirtualEditorNode(idx, -1)}
+                                      disabled={idx === 0}
+                                      className="p-1.5 text-muted-foreground hover:text-foreground hover:bg-muted rounded-md transition-colors disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:bg-transparent"
+                                      title="上移节点"
+                                      aria-label={`上移第 ${idx + 1} 个节点`}
+                                    >
+                                      <ChevronUp className="w-4 h-4" />
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() => swapVirtualEditorNode(idx, 1)}
+                                      disabled={idx === virtualEditorChain.length - 1}
+                                      className="p-1.5 text-muted-foreground hover:text-foreground hover:bg-muted rounded-md transition-colors disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:bg-transparent"
+                                      title="下移节点"
+                                      aria-label={`下移第 ${idx + 1} 个节点`}
+                                    >
+                                      <ChevronDown className="w-4 h-4" />
+                                    </button>
+                                    <button type="button" onClick={() => updateVirtualEditorChainDraft(prev => prev.filter((_, removeIdx) => removeIdx !== idx))} className="p-1.5 text-red-600 dark:text-red-500 hover:bg-red-500/10 rounded-md transition-colors" title="删除节点">
+                                      <X className="w-4 h-4" />
+                                    </button>
+                                  </div>
                                 </div>
 
                                 {isChannel ? (
@@ -3082,11 +4305,30 @@ export default function Channels() {
         </Dialog.Portal>
       </Dialog.Root>
 
+
       {/* Editor Side Sheet - Responsive */}
-      <Dialog.Root open={isModalOpen} onOpenChange={(open) => { setIsModalOpen(open); if (!open) setEditingSubChannel(null); }}>
+      {/* 修改原因：OAuth portal 弹窗打开时，编辑抽屉仍会接收到外部交互并尝试关闭。
+          修改方式：复用 isOAuthOverlayOpen 判断，在 OAuth 覆盖弹窗存在时忽略抽屉关闭请求。
+          目的：让用户处理 OAuth 弹窗时，底层编辑面板保持原状。 */}
+      <Dialog.Root open={isModalOpen} modal={!isOAuthOverlayOpen} onOpenChange={(open) => { if (!open && isOAuthOverlayOpen) return; setIsModalOpen(open); if (!open) setEditingSubChannel(null); }}>
         <Dialog.Portal>
           <Dialog.Overlay className="fixed inset-0 bg-black/60 z-40 animate-in fade-in duration-200" />
-          <Dialog.Content className="fixed right-0 top-0 h-full w-full sm:w-[560px] bg-background border-l border-border shadow-2xl z-50 flex flex-col animate-in slide-in-from-right duration-300">
+          {/* 修改原因：OAuth portal 弹窗位于 Dialog.Content 外部，Radix 会把外部焦点重新拉回编辑抽屉。
+              修改方式：OAuth 覆盖弹窗打开时，阻止外部焦点和外部交互事件的默认处理。
+              目的：允许 portal 弹窗中的 textarea 或 input 接收焦点，同时避免点击 OAuth 遮罩关闭底层抽屉。 */}
+          <Dialog.Content
+            className="fixed right-0 top-0 h-full w-full sm:w-[560px] bg-background border-l border-border shadow-2xl z-50 flex flex-col animate-in slide-in-from-right duration-300"
+            onFocusOutside={(e) => {
+              if (isOAuthOverlayOpen) {
+                e.preventDefault();
+              }
+            }}
+            onInteractOutside={(e) => {
+              if (isOAuthOverlayOpen) {
+                e.preventDefault();
+              }
+            }}
+          >
             <div className="p-4 sm:p-5 border-b border-border flex justify-between items-center bg-muted/30 flex-shrink-0">
               <Dialog.Title className="text-lg sm:text-xl font-bold text-foreground flex items-center gap-2">
                 <Server className="w-5 h-5 text-primary" />
@@ -3119,9 +4361,24 @@ export default function Channels() {
                           updateFormData('engine', val);
                           const sel = channelTypes.find(c => c.id === val);
                           if (sel?.default_base_url && !formData.base_url) updateFormData('base_url', sel.default_base_url);
+                          if (sel?.default_token_url && !formData.token_url) updateFormData('token_url', sel.default_token_url);
                         }} className="w-full bg-background border border-border focus:border-primary px-3 py-2 rounded-lg text-sm outline-none text-foreground">
                           <option value="">默认 (自动推断)</option>
-                          {channelTypes.map(c => <option key={c.id} value={c.id}>{c.description || c.id}</option>)}
+                          {(() => {
+                            const sort = (a: ChannelOption, b: ChannelOption) => {
+                              if (a.id === 'openai') return -1;
+                              if (b.id === 'openai') return 1;
+                              return (a.description || a.id).localeCompare(b.description || b.id);
+                            };
+                            const builtIn = channelTypes.filter(c => !c.is_oauth && c.source !== 'plugin').sort(sort);
+                            const oauth = channelTypes.filter(c => c.is_oauth && c.source !== 'plugin').sort(sort);
+                            const plugin = channelTypes.filter(c => c.source === 'plugin').sort(sort);
+                            return (<>
+                              <optgroup label="内置通用">{builtIn.map(c => <option key={c.id} value={c.id}>{c.description || c.id}</option>)}</optgroup>
+                              {oauth.length > 0 && <optgroup label="内置 OAuth">{oauth.map(c => <option key={c.id} value={c.id}>{c.description || c.id}</option>)}</optgroup>}
+                              {plugin.length > 0 && <optgroup label="插件渠道">{plugin.map(c => <option key={c.id} value={c.id}>{c.description || c.id}</option>)}</optgroup>}
+                            </>);
+                          })()}
                         </select>
                       </div>
                     </div>
@@ -3129,7 +4386,34 @@ export default function Channels() {
                       <label className="text-sm font-medium text-foreground mb-1.5 block">API 地址 (Base URL)</label>
                       <input type="text" value={formData.base_url} onChange={e => updateFormData('base_url', e.target.value)} placeholder="留空则使用渠道默认地址，末尾加 # 则不拼接路径后缀" className="w-full bg-background border border-border focus:border-primary px-3 py-2 rounded-lg text-sm font-mono outline-none text-foreground" />
                       <span className="text-xs text-muted-foreground mt-1 block">{'末尾加 # 可直接使用完整地址，不拼接路径后缀（如 https://example.com/v1/chat#）'}</span>
+                      {hasUiSlot(formData.engine, 'base_url_hint') && (
+                        <>
+                          {/* 修改原因：Base URL 的补充说明可能因渠道而异，通用前端不能写死具体渠道提示文案。 */}
+                          {/* 修改方式：在 Base URL 输入框下方提供 base_url_hint 挂载点，仅当当前 engine 注册该插槽时渲染 UiSlot。 */}
+                          {/* 目的：让渠道自行写入 Base URL 提示，未注册时不显示任何额外 DOM 或空白。 */}
+                          <UiSlot engine={formData.engine} slot="base_url_hint" data={null} element="div" className="text-xs text-muted-foreground mt-1" />
+                        </>
+                      )}
                     </div>
+                    {/* 修改原因：OAuth 引擎需要单独配置 token exchange/refresh 地址，不能再把 Base URL 当作 token endpoint。
+                        修改方式：仅在 OAuth 类型引擎下显示 token_url 输入框，并直接写入 formData.token_url。
+                        目的：用户可以为 Codex、Claude Code、Antigravity 配置反代 token endpoint，留空时仍使用 provider 默认值。 */}
+                    {isOAuthEngine && (
+                      <div className="space-y-1">
+                        <label className="text-xs font-medium text-muted-foreground">Token URL</label>
+                        <input
+                          type="text"
+                          value={formData.token_url || ''}
+                          onChange={e => setFormData(prev => prev ? { ...prev, token_url: e.target.value } : prev)}
+                          placeholder={channelTypes.find(c => c.id === formData.engine)?.default_token_url || '留空使用默认地址（如需反代可填写）'}
+                          className="w-full bg-muted border border-border rounded-lg p-2.5 text-sm outline-none focus:border-primary"
+                        />
+                        <p className="text-[10px] text-muted-foreground">OAuth token exchange 地址，用于换取和刷新 token。不填则使用各 provider 内置默认值。</p>
+                        {hasUiSlot(formData.engine, 'token_url_hint') && (
+                          <UiSlot engine={formData.engine} slot="token_url_hint" data={null} element="div" className="text-xs text-muted-foreground mt-1" />
+                        )}
+                      </div>
+                    )}
                     <div>
                       <label className="text-sm font-medium text-foreground mb-1.5 block">备注</label>
                       <textarea
@@ -3217,11 +4501,33 @@ export default function Channels() {
                       <button onClick={copyAllKeys} className="text-muted-foreground hover:text-foreground flex items-center gap-1"><Copy className="w-3 h-3" /> 复制全部</button>
                       <button
                         onClick={() => queryAllBalances()}
-                        disabled={balanceLoading || !formData.preferences?.balance}
+                        disabled={balanceLoading}
                         className="text-emerald-600 dark:text-emerald-400 hover:text-emerald-700 dark:hover:text-emerald-300 flex items-center gap-1 disabled:opacity-50 disabled:cursor-not-allowed"
-                        title={formData.preferences?.balance ? '查询所有 Key 的余额' : '未配置余额查询（在高级设置中配置 preferences.balance）'}
+                        title={isOAuthEngine ? '查询所有 OAuth 账号的额度' : '查询所有 Key 的余额'}
                       >
-                        <Wallet className={`w-3 h-3 ${balanceLoading ? 'animate-pulse' : ''}`} /> {balanceLoading ? '查询中...' : '余额'}
+                        <Wallet className={`w-3 h-3 ${balanceLoading ? 'animate-pulse' : ''}`} /> {balanceLoading ? '查询中...' : (() => {
+                          if (isOAuthEngine) {
+                            // 修改原因：OAuth 渠道的余额汇总文本可能来自渠道专属字段，通用前端不应读取 extra_usage 等具体字段。
+                            // 修改方式：存在 balance_summary 插槽时只传入全部 OAuth 账号作为 context，没有插槽时显示平台默认文本。
+                            // 目的：让 CC 等渠道自行汇总余额，Channels.tsx 只保留通用按钮挂载点。
+                            return hasUiSlot(formData.engine, 'balance_summary')
+                              ? <UiSlot engine={formData.engine} slot="balance_summary" data={null} context={{ accounts: oauthAccounts }} className="inline" fallbackText="余额" />
+                              : '余额';
+                          } else {
+                            const vals = Object.values(balanceResults).filter((b: any) => b?.supported && !b?.error);
+                            if (vals.length > 0) {
+                              const hasAmount = vals.some((b: any) => b.available != null);
+                              if (!hasAmount) {
+                                const pcts = vals.map((b: any) => getBalancePercent(b)).filter((p): p is number => p != null);
+                                if (pcts.length > 0) { const avg = pcts.reduce((s, p) => s + p, 0) / pcts.length; return <span title={`${pcts.length} 个 Key 平均`}>余额 <span className="font-mono">{avg.toFixed(0)}%</span></span>; }
+                              } else {
+                                const total = vals.reduce((s: number, b: any) => s + (b.available ?? 0), 0);
+                                return <span title={`${vals.length} 个 Key 合计`}>余额 <span className="font-mono">{total.toFixed(2)}</span></span>;
+                              }
+                            }
+                          }
+                          return '余额';
+                        })()}
                       </button>
                       <button
                         onClick={() => openKeyTestDialog(null)}
@@ -3242,7 +4548,15 @@ export default function Channels() {
                       <button onClick={addEmptyKey} className="text-primary hover:text-primary/80 flex items-center gap-1"><Plus className="w-3 h-3" /> 添加密钥</button>
                     </div>
                   </div>
-                  <div className="space-y-2 max-h-64 overflow-y-auto pr-1">
+                  {hasUiSlot(formData.engine, 'key_hint') && (
+                    <>
+                      {/* 修改原因：Key 列表附近的充值或使用提示属于渠道专属信息，通用前端不能硬编码具体链接或说明。 */}
+                      {/* 修改方式：在 Key 列表标题下方提供 key_hint 挂载点，仅当当前 engine 注册该插槽时渲染 UiSlot。 */}
+                      {/* 目的：让渠道自行写入 Key 区域提示，未注册时不显示任何额外 DOM 或空白。 */}
+                      <UiSlot engine={formData.engine} slot="key_hint" data={null} element="div" className="text-xs text-muted-foreground" />
+                    </>
+                  )}
+                  <div className="space-y-2 max-h-64 overflow-y-auto pr-1" onClick={e => { if (e.target === e.currentTarget) setFocusedKeyIdx(null); }}>
                     {formData.api_keys.map((keyObj, idx) => {
                       const providerName = formData.provider;
                       const rtDisabled = runtimeKeyStatus[providerName]?.auto_disabled || [];
@@ -3258,6 +4572,15 @@ export default function Channels() {
 
                       const isFocused = focusedKeyIdx === idx;
                       const bal = balanceResults[keyObj.key];
+                      const oauthAccount = oauthAccounts[keyObj.key];
+                      const oauthQuota = getOAuthQuota(oauthAccount);
+                      // 修改原因：Key 行只应知道通用插槽名，不能在渲染层读取 CC extra_usage 等渠道专属字段。
+                      // 修改方式：按当前 engine 查询各插槽是否存在，后续只决定挂载点和默认回退。
+                      // 目的：把边框、背景、额外标签和额度标签的渠道差异全部交给 ui_slots 脚本。
+                      const hasKeyBorderSlot = hasUiSlot(formData.engine, 'key_border');
+                      const hasKeyBackgroundSlot = hasUiSlot(formData.engine, 'key_background');
+                      const hasQuotaDisplaySlot = hasUiSlot(formData.engine, 'quota_display');
+                      const hasQuotaLabelSlot = hasUiSlot(formData.engine, 'quota_label');
 
                       if (isCooling) {
                         return (
@@ -3274,6 +4597,11 @@ export default function Channels() {
                             onToggle={() => toggleKeyDisabled(idx)}
                             onTest={() => openKeyTestDialog(idx)}
                             onDelete={() => deleteKey(idx)}
+                            onLabelChange={(label) => {
+                              const newKeys = [...formData.api_keys];
+                              newKeys[idx] = { ...newKeys[idx], label: label || undefined };
+                              setFormData(prev => prev ? { ...prev, api_keys: newKeys } : prev);
+                            }}
                           />
                         );
                       }
@@ -3281,35 +4609,97 @@ export default function Channels() {
                       const balPct = bal ? getBalancePercent(bal) : null;
                       const balColor = getBalanceColor(balPct);
                       const balLabel = bal ? getBalanceLabel(bal) : null;
-                      const hasTag = !isGrayed && (!!balLabel || isPermanent);
+                      // 修改原因：普通渠道余额结果现在可能包含 oai_tier 注入的 tier，即使没有可格式化余额也要预留标签空间。
+                      // 修改方式：从 balanceResults 读取 tier 并去空白，后续与 balLabel 组合显示。
+                      // 目的：让非 OAuth OpenAI 渠道可以在 Key 行显示 Tier 3 | $12.50 这类标签。
+                      const tierLabel = typeof bal?.tier === 'string' && bal.tier.trim() ? bal.tier.trim() : null;
+                      // 修改原因：右侧标签是否存在现在也可能由渠道插槽或普通渠道 tier 标签决定，不能只按内置余额标签计算遮罩。
+                      // 修改方式：把普通 tier 标签以及 quota_display、quota_label 的插槽存在性纳入 hasTag，具体内容仍由各自逻辑渲染。
+                      // 目的：保证 Key 备注遮罩在自定义插槽标签或 Tier 标签存在时仍给右侧留出空间。
+                      const hasTag = !isGrayed && (!!balLabel || !!tierLabel || isPermanent || (isOAuthEngine && (!!oauthQuota || !!oauthAccount || hasQuotaDisplaySlot || hasQuotaLabelSlot)));
 
                       return (
-                        <div key={idx} className={`relative flex items-center gap-2 px-3 py-2 rounded-lg border overflow-hidden transition-colors ${isFocused ? 'border-blue-500' : 'border-border'} ${isGrayed ? 'bg-muted/30 opacity-50' : 'bg-muted/50'}`}>
-                          {/* 余额进度条背景 */}
-                          {!isFocused && balColor && balPct != null && (
+                        <div key={idx} className={`relative flex items-center gap-2 px-3 py-2 rounded-lg border transition-colors ${isFocused ? 'border-blue-500' : 'border-border'} ${isGrayed ? (isFocused ? 'bg-muted/30' : 'bg-muted/30 opacity-50') : 'bg-muted/50'}`}>
+                          {/* 修改原因：key 行边框可能由渠道自定义，但默认 OAuth 双弧仍是平台通用能力。
+                              修改方式：存在 key_border 插槽时挂载 absolute div 并传入 quota/account；不存在时保留 QuotaBorderOverlay。
+                              目的：让渠道可以覆盖边框弧，同时不影响未注册插槽的 OAuth 渠道。 */}
+                          {isOAuthEngine && !isFocused && oauthQuota && (
+                            hasKeyBorderSlot
+                              ? <UiSlot engine={formData.engine} slot="key_border" data={oauthQuota} context={{ account: oauthAccount }} element="div" className="absolute inset-0 pointer-events-none z-[1]" />
+                              : <QuotaBorderOverlay quota5h={oauthQuota.quota_5h} quota7d={oauthQuota.quota_7d} />
+                          )}
+                          {/* 修改原因：OAuth 额外用量背景条属于渠道专属 UI，通用前端不应读取 extra_usage 字段或计算颜色。
+                              修改方式：仅在渠道注册 key_background 插槽时挂载覆盖整行的 absolute div，并把 quota/account 透传给脚本。
+                              目的：删除 extra_usage 背景条硬编码，让 CC 等渠道在 channel.py 中自行实现背景条。 */}
+                          {isOAuthEngine && !isFocused && oauthAccount && hasKeyBackgroundSlot && (
+                            <UiSlot engine={formData.engine} slot="key_background" data={oauthQuota} context={{ account: oauthAccount }} element="div" className="absolute inset-0 pointer-events-none rounded-[7px] z-0 transition-all duration-500" />
+                          )}
+                          {/* 普通余额背景条 */}
+                          {!isOAuthEngine && !isFocused && balColor && balPct != null && (
                             <div className="absolute left-0 top-0 bottom-0 rounded-[7px] z-0 pointer-events-none transition-all duration-500"
                                  style={{ width: `${Math.max(1, balPct)}%`, background: BALANCE_FILL_COLORS[balColor] }} />
                           )}
                           <span className="text-xs text-muted-foreground w-4 text-right relative z-[2]">{idx + 1}</span>
-                          <div className="flex-1 min-w-0 relative z-[2]" style={hasTag && !isFocused ? { WebkitMaskImage: 'linear-gradient(to right, black 0%, black 60%, transparent 100%)', maskImage: 'linear-gradient(to right, black 0%, black 60%, transparent 100%)' } : undefined}>
+
+                          {/* 修改原因：Key 备注遮罩需要按备注真实渲染宽度计算，不能继续使用固定 30% 宽度。
+                              修改方式：把备注覆盖层和输入框交给 KeyLabelOverlay 统一处理，由组件测量 label 后直接写入两个 mask。
+                              目的：短备注少占输入空间，长备注尽量完整显示，并保持右侧标签渐隐逻辑。 */}
+                          <KeyLabelOverlay label={keyObj.label} hasTag={hasTag} isFocused={isFocused}>
                             <input
                               type="text"
                               value={keyObj.key}
                               onChange={e => updateKey(idx, e.target.value)}
                               onPaste={e => handleKeyPaste(e, idx)}
-                              onFocus={() => setFocusedKeyIdx(idx)}
-                              onBlur={() => setFocusedKeyIdx(null)}
-                              placeholder="sk-..."
-                              className={`w-full bg-transparent border-none text-sm font-mono outline-none min-w-0 ${isGrayed ? 'text-muted-foreground line-through' : 'text-foreground'}`}
+                              onFocus={() => isOAuthEngine ? handleOAuthKeyFocus(idx, keyObj.key) : setFocusedKeyIdx(idx)}
+                              onBlur={e => { if (isOAuthEngine && !e.currentTarget.closest('[tabindex]')?.contains(e.relatedTarget as Node)) handleOAuthKeyBlur(idx, e.currentTarget.value); }}
+                              placeholder={isOAuthEngine ? "邮箱或标识符" : "sk-..."}
+                              className={`w-full bg-transparent border-none text-sm leading-5 font-mono outline-none min-w-0 ${isGrayed ? 'text-muted-foreground line-through' : 'text-foreground'}`}
                             />
-                          </div>
-                          {!isFocused && balLabel && balColor && (
-                            <span className={`flex-shrink-0 text-[10px] font-semibold font-mono px-1.5 py-0.5 rounded relative z-[2] ${TAG_CLASSES[balColor]}`}>{balLabel}</span>
+                          </KeyLabelOverlay>
+                          {isOAuthEngine && !keyObj.key && (
+                            <>
+                              {/* 修改原因：OAuth 新增空行需要把账号导入和后续浏览器登录入口放在输入框右侧。 */}
+                              <button onClick={() => openImportModal(idx)} className="text-xs px-2 py-1 rounded border border-border bg-muted hover:bg-muted/80 text-foreground flex items-center gap-1 relative z-[2]" title="粘贴 Refresh Token">
+                                <ClipboardPaste className="w-3 h-3" /> 导入
+                              </button>
+                              <button onClick={() => startOAuthLogin(idx)} className="text-xs px-2 py-1 rounded border border-primary/50 bg-primary/10 hover:bg-primary/20 text-primary flex items-center gap-1 relative z-[2]" title="浏览器登录">
+                                <LogIn className="w-3 h-3" /> 登录
+                              </button>
+                            </>
                           )}
+                          {/* 修改原因：quota_display 只是通用插槽之一，加载逻辑已泛化，调用点不应继续依赖旧单一额度插槽。
+                              修改方式：存在 quota_display 插槽时挂载 UiSlot，并把当前 OAuth 账号作为 context 传给渠道脚本；否则保留默认 QuotaArcs 百分比标签。
+                              目的：兼容 Antigravity、Codex 和 CC 的自定义标签，同时让 CC 能从 account 读取 subscription_type。 */}
+                          {isOAuthEngine && !isFocused && oauthQuota && (
+                            hasQuotaDisplaySlot
+                              ? <UiSlot engine={formData.engine} slot="quota_display" data={oauthQuota} context={{ account: oauthAccount }} className="flex-shrink-0 relative z-[2]" />
+                              : <QuotaArcs quota5h={oauthQuota.quota_5h} quota7d={oauthQuota.quota_7d} />
+                          )}
+                          {isOAuthEngine && !isFocused && oauthAccount && !oauthQuota && (
+                            <span className="text-[10px] font-medium px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-500 relative z-[2]">
+                              {oauthAccount.status === 'active' ? '已连接' : oauthAccount.status === 'error' ? '刷新失败' : '冷却中'}
+                            </span>
+                          )}
+                          {/* 修改原因：extra_usage 金额标签是渠道专属标签，不应由通用前端计算 remaining/limit。
+                              修改方式：存在 quota_label 插槽时挂载 UiSlot 并透传 quota/account；不存在时不渲染任何额外默认标签。
+                              目的：让 CC 的 $remaining / $limit 等展示由 claude_code_channel.py 维护。 */}
+                          {isOAuthEngine && !isFocused && oauthAccount && hasQuotaLabelSlot && (
+                            <UiSlot engine={formData.engine} slot="quota_label" data={oauthQuota} context={{ account: oauthAccount }} className="flex-shrink-0 relative z-[2]" />
+                          )}
+                          {!isOAuthEngine && !isFocused && (balLabel || tierLabel) && (() => {
+                            // 修改原因：普通 OpenAI 渠道需要在现有余额标签旁显示 oai_tier 注入的 tier 字段。
+                            // 修改方式：优先组合为 “Tier 3 | $12.50”，只有 tier 或只有余额时则单独显示；有余额时沿用余额颜色，只有 tier 时用蓝色弱提示样式。
+                            // 目的：不改变 OAuth 插槽和配额展示，只开放普通渠道 Key 行的 Tier 标签显示。
+                            const color = balColor || 'green';
+                            const label = tierLabel && balLabel ? `${tierLabel} | ${balLabel}` : (tierLabel || balLabel);
+                            const tagClass = balLabel ? TAG_CLASSES[color] : 'text-blue-400 bg-blue-500/12';
+                            return <span className={`flex-shrink-0 text-[10px] font-semibold font-mono px-1.5 py-0.5 rounded relative z-[2] ${tagClass}`}>{label}</span>;
+                          })()}
                           {!isFocused && isPermanent && <span className="text-[10px] px-1.5 py-0.5 rounded bg-red-500/15 text-red-500 dark:text-red-400 font-medium flex-shrink-0 relative z-[2]">永久禁用</span>}
                           {!isFocused && isPermanent && (
                             <button onClick={async () => { await apiFetch('/v1/channels/key_status/re_enable', { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` }, body: JSON.stringify({ provider: providerName, key: keyObj.key }) }); refreshKeyStatus(); }} className="text-[11px] px-2 py-0.5 rounded border border-emerald-500/50 bg-emerald-500/20 text-emerald-400 font-medium hover:bg-emerald-500/30 hover:border-emerald-400 cursor-pointer flex-shrink-0 relative z-[2] transition-colors">恢复</button>
                           )}
+
                           <button onClick={() => toggleKeyDisabled(idx)} className={`relative z-[2] ${isGrayed ? 'text-muted-foreground' : 'text-emerald-500'}`} title={keyObj.disabled ? "启用" : "禁用"}>
                             {keyObj.disabled ? <ToggleLeft className="w-5 h-5" /> : <ToggleRight className="w-5 h-5" />}
                           </button>
@@ -3317,11 +4707,43 @@ export default function Channels() {
                             <Play className="w-4 h-4" />
                           </button>
                           <button onClick={() => deleteKey(idx)} className="text-red-500 hover:text-red-400 ml-1 relative z-[2]"><Trash2 className="w-4 h-4" /></button>
+                          {/* Label 编辑：聚焦时在行底部展开 */}
+                          {isFocused && (
+                            <div className="absolute left-0 right-0 -bottom-6 flex items-center gap-1 z-[5]">
+                              <span className="text-[10px] text-muted-foreground/50 pl-8">备注:</span>
+                              <input
+                                type="text"
+                                value={keyObj.label || ''}
+                                onChange={e => {
+                                  const newKeys = [...formData.api_keys];
+                                  newKeys[idx] = { ...newKeys[idx], label: e.target.value || undefined };
+                                  setFormData(prev => prev ? { ...prev, api_keys: newKeys } : prev);
+                                }}
+                                onFocus={() => setFocusedKeyIdx(idx)}
+                                placeholder="点击添加备注"
+                                className="flex-1 bg-background/80 backdrop-blur-sm border border-border/50 rounded px-2 py-0.5 text-[11px] text-amber-600 dark:text-amber-400 font-mono outline-none focus:border-amber-500/50 placeholder:text-muted-foreground/30"
+                              />
+                            </div>
+                          )}
                         </div>
                       );
                     })}
                     {formData.api_keys.length === 0 && <div className="text-center p-4 text-sm text-muted-foreground italic">暂无密钥</div>}
                   </div>
+                  {isOAuthEngine && (
+                    <div className="mt-2 flex justify-end">
+                      {/* 修改原因：OAuth 凭据需要一个管理员显式导出入口，用于迁移或备份当前渠道。 */}
+                      {/* 修改方式：在 OAuth Key 列表底部增加小按钮，点击后下载 /v1/oauth/export 返回的 JSON。 */}
+                      {/* 目的：避免在普通账号列表中暴露 refresh_token，同时保留受控导出能力。 */}
+                      <button
+                        type="button"
+                        onClick={exportOAuthCredentials}
+                        className="text-xs text-amber-600 dark:text-amber-400 hover:text-amber-700 dark:hover:text-amber-300 flex items-center gap-1"
+                      >
+                        <Download className="w-3 h-3" /> 导出全部凭证
+                      </button>
+                    </div>
+                  )}
                 </section>}
 
                 {/* 3. 模型配置 */}
@@ -3485,7 +4907,21 @@ export default function Channels() {
                                   className="w-full bg-background border border-border px-3 py-1.5 rounded-lg text-xs text-foreground"
                                 >
                                   <option value="">选择引擎</option>
-                                  {channelTypes.map(c => <option key={c.id} value={c.id}>{c.description || c.id}</option>)}
+                                  {(() => {
+                            const sort = (a: ChannelOption, b: ChannelOption) => {
+                              if (a.id === 'openai') return -1;
+                              if (b.id === 'openai') return 1;
+                              return (a.description || a.id).localeCompare(b.description || b.id);
+                            };
+                            const builtIn = channelTypes.filter(c => !c.is_oauth && c.source !== 'plugin').sort(sort);
+                            const oauth = channelTypes.filter(c => c.is_oauth && c.source !== 'plugin').sort(sort);
+                            const plugin = channelTypes.filter(c => c.source === 'plugin').sort(sort);
+                            return (<>
+                              <optgroup label="内置通用">{builtIn.map(c => <option key={c.id} value={c.id}>{c.description || c.id}</option>)}</optgroup>
+                              {oauth.length > 0 && <optgroup label="内置 OAuth">{oauth.map(c => <option key={c.id} value={c.id}>{c.description || c.id}</option>)}</optgroup>}
+                              {plugin.length > 0 && <optgroup label="插件渠道">{plugin.map(c => <option key={c.id} value={c.id}>{c.description || c.id}</option>)}</optgroup>}
+                            </>);
+                          })()}
                                 </select>
                               </div>
 
@@ -3765,121 +5201,56 @@ export default function Channels() {
                         </div>
                       </div>
                       <p className="text-xs text-muted-foreground mb-3">
-                        按顺序匹配，第一个命中的规则生效。duration: -1 = 永久禁用，0 = 仅映射不处理 Key，&gt;0 = 冷却秒数。
+                        按顺序匹配，首条命中生效。Key 处理：冷却=暂时停用，永久禁用=需手动恢复。重试：自动=沿用内置逻辑(4xx不重试，5xx/429重试)，换Key=强制用其他Key重试，报错=跳过重试直接返回客户端。
                       </p>
 
                       {/* 规则列表 */}
-                      <div className="space-y-2">
+                      {/* 修改原因：旧版 Key Rules 使用序号列和两行卡片，导致规则区域过高且条件与动作被割裂。 */}
+                      {/* 修改方式：改为桌面端单行、移动端两行的紧凑列表，并用底部分隔线替代卡片背景。 */}
+                      {/* 目的：保留原有编辑、重试三态和 remap 折叠功能，同时减少纵向空间占用。 */}
+                      <div className="space-y-1">
                         {(formData.preferences.key_rules || []).map((rule: any, idx: number) => {
                           const rules = formData.preferences.key_rules || [];
-                          const updateRule = (patch: any) => {
-                            const next = [...rules];
-                            next[idx] = { ...next[idx], ...patch };
-                            updatePreference('key_rules', next);
-                          };
-                          const removeRule = () => {
-                            updatePreference('key_rules', rules.filter((_: any, i: number) => i !== idx));
-                          };
-                          const matchType = rule.match === 'default' ? 'default' : rule.match?.status ? 'status' : rule.match?.keyword ? 'keyword' : 'status';
-                          const matchValue = matchType === 'status'
-                            ? (rule.match?.status || []).join(', ')
-                            : matchType === 'keyword'
-                            ? (Array.isArray(rule.match?.keyword) ? rule.match.keyword.join(', ') : rule.match?.keyword || '')
-                            : '';
-
+                          const replaceRule = (r: any) => { const n = [...rules]; n[idx] = r; updatePreference('key_rules', n); };
+                          const updateRule = (p: any) => replaceRule({ ...rules[idx], ...p });
+                          const clearField = (f: 'remap' | 'retry') => { const r = { ...rules[idx] }; delete r[f]; replaceRule(r); };
+                          const removeRule = () => updatePreference('key_rules', rules.filter((_: any, i: number) => i !== idx));
+                          const mt = rule.match === 'default' ? 'default' : rule.match?.keyword ? 'keyword' : 'status';
+                          const retryMode = getKeyRuleRetryMode(rule);
+                          const durationMode = rule.duration === -1 ? '-1' : Number(rule.duration) > 0 ? 'cd' : '0';
+                          const controlClass = 'h-6 bg-background border border-border rounded px-1 py-0 text-[11px] leading-none text-foreground';
+                          const inputClass = `${controlClass} font-mono`;
+                          const retryOptions: [KeyRuleRetryMode, string, string][] = [['default', '自动', '沿用内置重试逻辑'], ['force', '换Key', '强制用其他Key重试'], ['disable', '报错', '跳过重试直接返回']];
                           return (
-                            <div key={idx} className="flex items-center gap-2 bg-muted/30 border border-border rounded-lg px-3 py-2">
-                              {/* 匹配类型 */}
-                              <select
-                                value={matchType}
-                                onChange={e => {
-                                  const t = e.target.value;
-                                  if (t === 'default') updateRule({ match: 'default' });
-                                  else if (t === 'status') updateRule({ match: { status: [429] } });
-                                  else if (t === 'keyword') updateRule({ match: { keyword: [''] } });
-                                }}
-                                className="bg-background border border-border rounded px-2 py-1 text-xs text-foreground w-20 flex-shrink-0"
-                              >
-                                <option value="status">状态码</option>
-                                <option value="keyword">关键词</option>
-                                <option value="default">默认</option>
-                              </select>
-
-                              {/* 匹配值 */}
-                              {matchType !== 'default' && (
-                                <input
-                                  type="text"
-                                  value={matchValue}
-                                  onChange={e => {
-                                    const val = e.target.value;
-                                    if (matchType === 'status') {
-                                      const codes = val.split(/[,\s]+/).map(s => parseInt(s.trim())).filter(n => !isNaN(n));
-                                      updateRule({ match: { status: codes } });
-                                    } else {
-                                      const kws = val.split(/[,]/).map(s => s.trim()).filter(Boolean);
-                                      updateRule({ match: { keyword: kws.length > 0 ? kws : [''] } });
-                                    }
-                                  }}
-                                  placeholder={matchType === 'status' ? '429, 500' : 'quota, billing'}
-                                  className="flex-1 min-w-0 bg-background border border-border rounded px-2 py-1 text-xs font-mono text-foreground"
-                                />
-                              )}
-                              {matchType === 'default' && <div className="flex-1 text-xs text-muted-foreground italic">兜底规则</div>}
-
-                              {/* 箭头 */}
-                              <span className="text-muted-foreground text-xs flex-shrink-0">→</span>
-
-                              {/* Duration */}
-                              <select
-                                value={rule.duration === -1 ? '-1' : rule.duration > 0 ? 'custom' : '0'}
-                                onChange={e => {
-                                  const v = e.target.value;
-                                  if (v === '-1') updateRule({ duration: -1 });
-                                  else if (v === '0') updateRule({ duration: 0 });
-                                  else updateRule({ duration: rule.duration > 0 ? rule.duration : 60 });
-                                }}
-                                className="bg-background border border-border rounded px-2 py-1 text-xs text-foreground w-24 flex-shrink-0"
-                              >
-                                <option value="-1">永久禁用</option>
-                                <option value="custom">冷却</option>
-                                <option value="0">仅映射</option>
-                              </select>
-
-                              {rule.duration > 0 && (
-                                <div className="flex items-center gap-1 flex-shrink-0">
-                                  <input
-                                    type="number"
-                                    value={rule.duration}
-                                    onChange={e => updateRule({ duration: Math.max(1, parseInt(e.target.value) || 1) })}
-                                    min={1}
-                                    className="w-16 bg-background border border-border rounded px-2 py-1 text-xs font-mono text-foreground"
-                                  />
-                                  <span className="text-xs text-muted-foreground">秒</span>
+                            <div key={idx} className="border-b border-border py-1 text-[11px]">
+                              <div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:gap-1 sm:flex-nowrap">
+                                <div className="flex min-w-0 items-center gap-1 sm:shrink-0">
+                                  <select value={mt} onChange={e => { const v = e.target.value; if (v === 'default') updateRule({ match: 'default' }); else if (v === 'status') updateRule({ match: { status: [429] } }); else updateRule({ match: { keyword: [''] } }); }} className={`${controlClass} w-[64px] sm:w-[66px]`}>
+                                    <option value="status">状态码</option>
+                                    <option value="keyword">关键词</option>
+                                    <option value="default">default</option>
+                                  </select>
+                                  {mt === 'status' && <DeferredInput inputMode="numeric" value={formatKeyRuleStatusInput(rule.match?.status)} onCommit={v => updateRule({ match: { status: parseKeyRuleStatusInput(v) } })} placeholder="429" className={`${inputClass} w-[68px]`} />}
+                                  {mt === 'keyword' && <DeferredInput value={formatKeyRuleKeywordsInput(rule.match?.keyword)} onCommit={v => updateRule({ match: { keyword: parseKeyRuleKeywordsInput(v) } })} placeholder="quota, rate limit" className={`${inputClass} w-[110px] sm:w-[118px]`} />}
+                                  <button type="button" onClick={removeRule} className="ml-auto inline-flex h-6 w-6 items-center justify-center text-red-500/60 hover:text-red-500 sm:hidden" title="删除"><X className="h-3 w-3" /></button>
                                 </div>
-                              )}
-
-                              {/* Remap (可选) */}
-                              {matchType === 'status' && (
-                                <div className="flex items-center gap-1 flex-shrink-0">
-                                  <span className="text-[10px] text-muted-foreground">映射</span>
-                                  <input
-                                    type="number"
-                                    value={rule.remap || ''}
-                                    onChange={e => {
-                                      const v = parseInt(e.target.value);
-                                      if (!isNaN(v) && v >= 100 && v <= 599) updateRule({ remap: v });
-                                      else { const { remap: _, ...rest } = rules[idx]; const next = [...rules]; next[idx] = rest; updatePreference('key_rules', next); }
-                                    }}
-                                    placeholder="-"
-                                    className="w-14 bg-background border border-border rounded px-1.5 py-1 text-xs font-mono text-foreground"
-                                  />
+                                <span className="hidden h-5 w-px bg-border sm:block" aria-hidden="true" />
+                                <div className="flex min-w-0 flex-wrap items-center gap-1 sm:flex-1 sm:flex-nowrap">
+                                  <select value={durationMode} onChange={e => { const v = e.target.value; if (v === '-1') updateRule({ duration: -1 }); else if (v === '0') updateRule({ duration: 0 }); else updateRule({ duration: Number(rule.duration) > 0 ? Number(rule.duration) : 60 }); }} className={`${controlClass} w-[72px]`}>
+                                    <option value="cd">冷却</option>
+                                    <option value="-1">永久禁用</option>
+                                    <option value="0">不处理</option>
+                                  </select>
+                                  {Number(rule.duration) > 0 && <><input type="number" min={1} value={rule.duration} onChange={e => updateRule({ duration: Math.max(1, parseInt(e.target.value, 10) || 1) })} className={`${inputClass} w-[46px]`} /><span className="text-[10px] text-muted-foreground">s</span></>}
+                                  <div className="inline-flex h-6 overflow-hidden rounded border border-border" title="重试控制">
+                                    {retryOptions.map(([v, l, tip]) => (
+                                      <button key={v} type="button" title={tip} onClick={() => replaceRule(setKeyRuleRetryMode(rule, v))} className={`px-1.5 text-[10px] leading-none transition-colors ${retryMode === v ? v === 'force' ? 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 font-semibold' : v === 'disable' ? 'bg-red-500/15 text-red-600 dark:text-red-400 font-semibold' : 'bg-muted text-muted-foreground font-semibold' : 'text-muted-foreground hover:bg-muted/50 hover:text-foreground'}`}>{l}</button>
+                                    ))}
+                                  </div>
+                                  {rule.remap != null ? (<span className="inline-flex h-6 items-center gap-0.5"><span className="text-[10px] text-muted-foreground">↔</span><input type="number" min={100} max={599} value={rule.remap} onChange={e => { const raw = e.target.value.trim(); if (!raw) clearField('remap'); else updateRule({ remap: raw }); }} placeholder="码" title="错误码映射" className={`${inputClass} w-[42px]`} /><button type="button" onClick={() => clearField('remap')} className="inline-flex h-6 w-4 items-center justify-center text-[10px] text-muted-foreground hover:text-foreground" title="移除映射">×</button></span>) : (<button type="button" onClick={() => updateRule({ remap: '' })} className="inline-flex h-6 w-6 items-center justify-center rounded border border-transparent text-[11px] text-muted-foreground hover:border-border hover:text-foreground" title="添加错误码映射">↔</button>)}
                                 </div>
-                              )}
-
-                              {/* 删除 */}
-                              <button onClick={removeRule} className="text-red-500 hover:text-red-400 flex-shrink-0 p-0.5">
-                                <X className="w-3.5 h-3.5" />
-                              </button>
+                                <button type="button" onClick={removeRule} className="ml-auto hidden h-6 w-6 shrink-0 items-center justify-center text-red-500/60 hover:text-red-500 sm:inline-flex" title="删除"><X className="h-3 w-3" /></button>
+                              </div>
                             </div>
                           );
                         })}
@@ -4027,7 +5398,17 @@ export default function Channels() {
                         placeholder='{"all": {"temperature": 0.1}}'
                         className="w-full bg-background border border-border px-3 py-2 rounded-lg text-sm font-mono focus:border-primary outline-none text-foreground"
                       />
-                      <p className="text-xs text-muted-foreground mt-1">失焦时自动格式化</p>
+                      <p className="text-xs text-muted-foreground mt-1">
+                        失焦时自动格式化。key 为 <code className="px-1 py-0.5 bg-muted rounded text-[11px]">all</code> 或 <code className="px-1 py-0.5 bg-muted rounded text-[11px]">*</code> 全局生效，模型名精确匹配。dict 递归合并，数组整体覆写，key 加 <code className="px-1 py-0.5 bg-muted rounded text-[11px]">+</code> 前缀追加数组（如 <code className="px-1 py-0.5 bg-muted rounded text-[11px]">+tools</code>）。值为 <code className="px-1 py-0.5 bg-muted rounded text-[11px]">null</code> 删除该字段。
+                      </p>
+                      {hasUiSlot(formData.engine, 'override_hint') && (
+                        <>
+                          {/* 修改原因：请求体覆写格式可能因渠道协议不同而不同，通用前端不能写死 Antigravity 等渠道的专属提醒。 */}
+                          {/* 修改方式：在请求体覆写说明文字下方提供 override_hint 挂载点，仅当当前 engine 注册该插槽时渲染 UiSlot。 */}
+                          {/* 目的：让渠道自行写入参数覆写提示，未注册时不显示任何额外 DOM 或空白。 */}
+                          <UiSlot engine={formData.engine} slot="override_hint" data={null} element="div" className="text-xs text-amber-600 dark:text-amber-400 mt-1" />
+                        </>
+                      )}
                     </div>
 
                     <div className="flex items-center justify-between p-3 bg-muted/50 rounded-lg border border-border">
@@ -4132,8 +5513,10 @@ export default function Channels() {
                       )}
                     </div>
 
-                    {/* 余额查询配置 */}
-                    <div className="border-t border-border pt-4">
+                    {/* 修改原因：OAuth 渠道余额由后端 OAuthManager 自动查询，不需要用户配置 endpoint、template 或字段映射。
+                        修改方式：仅普通渠道渲染余额查询配置块，OAuth 渠道完全隐藏这一区域。
+                        目的：避免用户在 OAuth 引擎下看到无效的普通余额配置项。 */}
+                    {!isOAuthEngine && <div className="border-t border-border pt-4">
                       <div className="flex items-center justify-between mb-3">
                         <label className="text-sm font-medium text-foreground flex items-center gap-1.5">
                           <Wallet className="w-3.5 h-3.5 text-emerald-500" /> 余额查询
@@ -4176,7 +5559,7 @@ export default function Channels() {
                                 }}
                                 className="w-full bg-background border border-border px-3 py-1.5 rounded-lg text-xs focus:border-primary outline-none text-foreground"
                               >
-                                <option value="new-api">new-api（/api/status）</option>
+                                <option value="new-api">new-api（/api/usage/token）</option>
                                 <option value="openrouter">OpenRouter</option>
                                 <option value="_custom">自定义</option>
                               </select>
@@ -4189,23 +5572,36 @@ export default function Channels() {
                                     type="text"
                                     value={bal.endpoint || ''}
                                     onChange={e => updatePreference('balance', { ...bal, endpoint: e.target.value })}
-                                    placeholder="/api/status 或 https://example.com/balance"
+                                    placeholder="/api/usage/token 或 https://example.com/balance"
                                     className="w-full bg-background border border-border px-3 py-1.5 rounded-lg text-xs font-mono focus:border-primary outline-none text-foreground"
                                   />
                                   <p className="text-xs text-muted-foreground mt-1">相对路径拼接到域名下，绝对 URL 直接使用</p>
                                 </div>
                                 <div>
+                                  <label className="text-xs font-medium text-muted-foreground mb-1 block">请求方式</label>
+                                  <select
+                                    value={bal.method || 'GET'}
+                                    onChange={e => updatePreference('balance', { ...bal, method: e.target.value })}
+                                    className="w-full bg-background border border-border px-3 py-1.5 rounded-lg text-xs focus:border-primary outline-none text-foreground"
+                                  >
+                                    <option value="GET">GET</option>
+                                    <option value="POST">POST</option>
+                                  </select>
+                                </div>
+                                <div>
                                   <label className="text-xs font-medium text-muted-foreground mb-1 block">值类型</label>
                                   <select
-                                    value={bal.mapping?.value_type === "'percent'" ? 'percent' : 'amount'}
+                                    value={bal.mapping?.value_type === "'percent'" ? 'percent' : bal.mapping?.value_type === "'quota'" ? 'quota' : 'amount'}
                                     onChange={e => {
-                                      const vt = e.target.value === 'percent' ? "'percent'" : "'amount'";
+                                      const vtMap: Record<string, string> = { percent: "'percent'", quota: "'quota'", amount: "'amount'" };
+                                      const vt = vtMap[e.target.value] || "'amount'";
                                       updatePreference('balance', { ...bal, mapping: { ...(bal.mapping || {}), value_type: vt } });
                                     }}
                                     className="w-full bg-background border border-border px-3 py-1.5 rounded-lg text-xs focus:border-primary outline-none text-foreground"
                                   >
                                     <option value="amount">数额（total / used / available）</option>
                                     <option value="percent">百分比（percent）</option>
+                                    <option value="quota">纯额度（以 100 为基准显示颜色）</option>
                                   </select>
                                 </div>
                                 <div>
@@ -4213,6 +5609,9 @@ export default function Channels() {
                                   <div className="space-y-2">
                                     {(bal.mapping?.value_type === "'percent'" ? [
                                       { key: 'percent', label: 'percent', placeholder: 'data.remaining_percent' },
+                                    ] : bal.mapping?.value_type === "'quota'" ? [
+                                      { key: 'available', label: 'available', placeholder: 'balance_infos.0.total_balance' },
+                                      { key: 'currency', label: 'currency (可选)', placeholder: 'balance_infos.0.currency' },
                                     ] : [
                                       { key: 'total', label: 'total', placeholder: 'data.totalQuota' },
                                       { key: 'used', label: 'used', placeholder: 'data.usedQuota' },
@@ -4252,7 +5651,7 @@ export default function Channels() {
                           </div>
                         );
                       })()}
-                    </div>
+                    </div>}
 
                   </div>
                 </section>
@@ -4401,6 +5800,63 @@ export default function Channels() {
         onOpenChange={setAnalyticsOpen}
         providerName={analyticsProvider}
       />
+
+      {/* 修改原因：OAuth 导入弹窗需要脱离编辑抽屉层级，并提供可聚焦容器用于焦点回退。
+          修改方式：继续使用 createPortal 渲染到 body，并在遮罩容器添加 tabIndex={-1}。
+          目的：让导入弹窗输入框能在 Radix 编辑抽屉存在时稳定获得焦点。 */}
+      {importModalIdx !== null && createPortal(
+        <div tabIndex={-1} className="fixed inset-0 z-[100] flex items-center justify-center bg-black/50" onClick={() => setImportModalIdx(null)}>
+          <div className="bg-background border border-border rounded-xl p-6 w-[400px] max-w-[90vw] space-y-4" onClick={e => e.stopPropagation()}>
+            <h3 className="text-sm font-semibold">导入 Refresh Token</h3>
+            <p className="text-xs text-muted-foreground">从 CLIProxyAPI 配置或本地 OAuth 文件中复制 refresh_token 粘贴到下方</p>
+            <textarea
+              value={importToken}
+              onChange={e => setImportToken(e.target.value)}
+              placeholder="rt_xxxxxxxx..."
+              className="w-full bg-muted border border-border rounded-lg p-3 text-sm font-mono outline-none focus:border-primary min-h-[80px] resize-none"
+              autoFocus
+            />
+            <div className="flex justify-end gap-2">
+              <button onClick={() => setImportModalIdx(null)} className="text-sm px-3 py-1.5 rounded border border-border hover:bg-muted">取消</button>
+              <button onClick={doImport} disabled={!importToken.trim() || importing} className="text-sm px-3 py-1.5 rounded bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-50">
+                {importing ? '导入中...' : '导入'}
+              </button>
+            </div>
+          </div>
+        </div>,
+        document.body
+      )}
+
+      {/* 修改原因：OAuth 手动回调弹窗同样位于编辑抽屉外部，需要避免焦点回退到 Dialog.Content。
+          修改方式：继续使用 createPortal 渲染到 body，并在遮罩容器添加 tabIndex={-1}。
+          目的：让用户粘贴完整回调 URL 时，输入框可以正常点击和输入。 */}
+      {oauthManualState !== null && createPortal(
+        <div tabIndex={-1} className="fixed inset-0 z-[100] flex items-center justify-center bg-black/50" onClick={() => { setOauthManualState(null); setManualUrl(''); }}>
+          <div className="bg-background border border-border rounded-xl p-6 w-[480px] max-w-[90vw] space-y-4" onClick={e => e.stopPropagation()}>
+            <h3 className="text-sm font-semibold">完成 OAuth 登录</h3>
+            <div className="text-xs text-muted-foreground space-y-2">
+              <p>1. 在弹出的窗口中完成登录</p>
+              <p>2. 登录后浏览器会跳转到一个<strong>无法访问</strong>的页面，这是正常的</p>
+              <p>3. 复制该页面地址栏的<strong>完整 URL</strong>，粘贴到下方</p>
+            </div>
+            <input
+              type="text"
+              value={manualUrl}
+              onChange={e => setManualUrl(e.target.value)}
+              placeholder="http://localhost:1455/auth/callback?code=..."
+              className="w-full bg-muted border border-border rounded-lg p-3 text-sm font-mono outline-none focus:border-primary"
+              autoFocus
+            />
+            <div className="flex justify-end gap-2">
+              <button onClick={() => { setOauthManualState(null); setManualUrl(''); }} className="text-sm px-3 py-1.5 rounded border border-border hover:bg-muted">取消</button>
+              <button onClick={doManualExchange} disabled={!manualUrl.trim() || exchanging} className="text-sm px-3 py-1.5 rounded bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-50">
+                {exchanging ? '验证中...' : '完成登录'}
+              </button>
+            </div>
+          </div>
+        </div>,
+        document.body
+      )}
     </div>
   );
 }

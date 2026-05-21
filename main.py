@@ -16,6 +16,7 @@ from fastapi import FastAPI, HTTPException, Request
 
 from core.log_config import logger
 from routes import api_router
+from routes.oauth import router as oauth_router
 from core.env import env_bool
 from core.log_config import apply_backend_log_preferences
 from core.watchdog import EventLoopBlockWatchdog as LightWatchdog
@@ -110,10 +111,13 @@ async def cleanup_expired_raw_data():
                 if (DB_TYPE or "sqlite").lower() == "d1":
                     result = await db.execute(
                         "UPDATE request_stats "
-                        "SET request_headers = NULL, request_body = NULL, upstream_request_headers = NULL, upstream_request_body = NULL, upstream_response_body = NULL, response_body = NULL, retry_path = NULL "
+                        # 修改原因：新增 upstream_response_headers 后，过期原始数据清理需要同步覆盖该列。
+                        # 修改方式：在 D1 清理 SQL 的 SET 和非空判断中加入 upstream_response_headers。
+                        # 目的：避免响应头超过保留期后仍留在 request_stats。
+                        "SET request_headers = NULL, request_body = NULL, upstream_request_headers = NULL, upstream_request_body = NULL, upstream_response_headers = NULL, upstream_response_body = NULL, response_body = NULL, retry_path = NULL "
                         "WHERE raw_data_expires_at IS NOT NULL "
                         "AND raw_data_expires_at < ? "
-                        "AND (request_headers IS NOT NULL OR request_body IS NOT NULL OR upstream_request_headers IS NOT NULL OR upstream_request_body IS NOT NULL OR upstream_response_body IS NOT NULL OR response_body IS NOT NULL OR retry_path IS NOT NULL)",
+                        "AND (request_headers IS NOT NULL OR request_body IS NOT NULL OR upstream_request_headers IS NOT NULL OR upstream_request_body IS NOT NULL OR upstream_response_headers IS NOT NULL OR upstream_response_body IS NOT NULL OR response_body IS NOT NULL OR retry_path IS NOT NULL)",
                         [now],
                     )
                     rowcount = int((result.get("meta") or {}).get("changes") or 0)
@@ -132,6 +136,10 @@ async def cleanup_expired_raw_data():
                         (RequestStat.request_body.isnot(None)) |
                         (RequestStat.upstream_request_headers.isnot(None)) |
                         (RequestStat.upstream_request_body.isnot(None)) |
+                        # 修改原因：SQLAlchemy 分支的过期清理条件也必须包含新增响应头字段。
+                        # 修改方式：在非空条件中追加 RequestStat.upstream_response_headers。
+                        # 目的：只有响应头未清理的旧记录也能被匹配并清空。
+                        (RequestStat.upstream_response_headers.isnot(None)) |
                         (RequestStat.upstream_response_body.isnot(None)) |
                         (RequestStat.response_body.isnot(None)) |
                         (RequestStat.retry_path.isnot(None))
@@ -141,6 +149,10 @@ async def cleanup_expired_raw_data():
                         request_body=None,
                         upstream_request_headers=None,
                         upstream_request_body=None,
+                        # 修改原因：清理动作匹配后需要实际清空新增响应头字段。
+                        # 修改方式：在 update().values 中把 upstream_response_headers 设为 None。
+                        # 目的：保证 SQLAlchemy 数据库类型与 D1 的清理结果一致。
+                        upstream_response_headers=None,
                         upstream_response_body=None,
                         response_body=None,
                         retry_path=None,
@@ -151,6 +163,26 @@ async def cleanup_expired_raw_data():
 
                 if result.rowcount > 0:
                     logger.info(f"Cleaned up expired raw data from {result.rowcount} log entries")
+                    # SQLite DELETE/UPDATE 不释放磁盘空间，需要 VACUUM 回收 freelist。
+                    # 只在 SQLite 且确实清理了数据时执行，避免 PostgreSQL/MySQL 上不必要的开销。
+                    # VACUUM 必须在事务外执行，用独立的 raw connection + autocommit。
+                    if (DB_TYPE or "sqlite").lower() == "sqlite":
+                        try:
+                            import aiosqlite
+                            db_path = None
+                            try:
+                                from db import DATABASE_URL
+                                if DATABASE_URL and DATABASE_URL.startswith("sqlite"):
+                                    db_path = DATABASE_URL.split("///")[-1]
+                            except Exception:
+                                pass
+                            if not db_path:
+                                db_path = "data/stats.db"
+                            async with aiosqlite.connect(db_path) as vacuum_conn:
+                                await vacuum_conn.execute("VACUUM")
+                                logger.info("SQLite VACUUM completed after raw data cleanup")
+                        except Exception as ve:
+                            logger.warning(f"SQLite VACUUM failed (non-critical): {ve}")
                     
         except asyncio.CancelledError:
             logger.info("Raw data cleanup task cancelled")
@@ -336,6 +368,26 @@ async def cleanup_expired_logs(app):
             next_sleep_seconds = 60
 
 
+def _register_oauth_providers_from_registry(oauth_manager) -> None:
+    """从渠道注册表统一注册 OAuth provider。"""
+    # 修改原因：OAuth provider 注册不能继续写在 main.py 的固定渠道清单里，否则内置渠道和插件渠道会走两套路径。
+    # 修改方式：遍历 registry 中所有 ChannelDefinition，发现 oauth_provider 后按 channel_id 注册到 OAuthManager。
+    # 目的：让 register_channel 成为 OAuth provider 声明的唯一入口，并支持插件在加载后自动加入 OAuthManager。
+    from core.channels.registry import get_all_channels
+
+    for channel_id, channel_def in get_all_channels().items():
+        oauth_provider = channel_def.oauth_provider
+        if oauth_provider is None:
+            continue
+        bind_oauth_manager = getattr(oauth_provider, "set_oauth_manager", None)
+        if callable(bind_oauth_manager):
+            # 修改原因：Codex 的被动额度采集仍需要共享 OAuthManager 执行 update_quota，旧硬编码入口移除后必须保留这个绑定点。
+            # 修改方式：provider 若声明 set_oauth_manager 钩子，就在通用扫描注册前注入当前 OAuthManager。
+            # 目的：保留渠道内部必要副作用，同时不把具体渠道名称重新写回 main.py。
+            bind_oauth_manager(oauth_manager)
+        oauth_manager.register_provider(channel_id, oauth_provider)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # 启动时的代码
@@ -460,6 +512,22 @@ async def lifespan(app: FastAPI):
         app.state.client_manager = ClientManager(pool_size=300, max_keepalive_connections=100)
         await app.state.client_manager.init(default_config)
 
+    if app and not hasattr(app.state, 'oauth_manager'):
+        # 修改原因：handler 解析 OAuth key_id 时需要访问共享的凭据管理器。
+        # 修改方式：在 lifespan 启动期创建 OAuthManager 并加载 data/oauth_state.json。
+        # 目的：让请求路径只做内存查找和必要刷新，不在每次请求重复读取文件。
+        from core.oauth.manager import OAuthManager
+        app.state.oauth_manager = OAuthManager()
+        # 修改原因：OAuthManager.init 会把旧扁平 oauth_state.json 按 api.yaml 中的 provider name 自动迁移。
+        # 修改方式：先注入 app.state.config getter，再执行 init，让迁移阶段能读取当前 providers 配置。
+        # 目的：启动迁移可以把旧凭据放入正确渠道，而不是全部落入 _unmapped。
+        app.state.oauth_manager.set_config_ref(lambda: app.state.config or {})
+        await app.state.oauth_manager.init()
+        # 修改原因：OAuth provider 注册已迁移到 ChannelDefinition.oauth_provider，main.py 不应再知道具体渠道模块。
+        # 修改方式：启动时扫描 registry 中所有声明了 oauth_provider 的渠道，并统一注册到 OAuthManager。
+        # 目的：消除 Codex、Claude Code、Gemini CLI 等渠道硬编码，让内置渠道和插件渠道共享注册路径。
+        _register_oauth_providers_from_registry(app.state.oauth_manager)
+
 
     if app and not hasattr(app.state, "channel_manager"):
         if app.state.config and 'preferences' in app.state.config:
@@ -493,6 +561,11 @@ async def lifespan(app: FastAPI):
             for group in load_result.values()
         )
         logger.info("Plugin system initialized: %d/%d plugins enabled", enabled, total)
+        if hasattr(app.state, "oauth_manager"):
+            # 修改原因：外置插件渠道通常在 plugin_manager.load_all() 时才调用 register_channel，早于此处的 OAuth 扫描看不到它们。
+            # 修改方式：插件加载完成后再次扫描 registry；重复注册内置 provider 只会覆盖为同一个声明实例。
+            # 目的：让插件 OAuth 渠道和内置 OAuth 渠道真正走同一条 registry 自动注册路径。
+            _register_oauth_providers_from_registry(app.state.oauth_manager)
     except Exception as e:
         logger.error("Failed to initialize plugin system: %s", e)
 
@@ -603,6 +676,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan, debug=is_debug)
 app.include_router(api_router)
+app.include_router(oauth_router)
 
 
 def generate_markdown_docs():

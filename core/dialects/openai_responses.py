@@ -530,6 +530,50 @@ async def responses_handler(
     )
 
 
+async def responses_subpath_handler(
+    request: "Request",
+    background_tasks: "BackgroundTasks",
+    api_index: int,
+    **kwargs,
+):
+    """
+    OpenAI Responses compact endpoint - POST /v1/responses/compact
+
+    Compact is a native Responses auxiliary endpoint.  Keep the original payload
+    for upstream passthrough and only build a minimal RequestModel for auth,
+    rate limit, model routing, and provider selection.
+    """
+    from core.error_response import openai_error_response
+    from routes.deps import get_model_handler
+
+    try:
+        native_body: Dict[str, Any] = await request.json()
+    except Exception:
+        native_body = {}
+
+    model = native_body.get("model")
+    if not isinstance(model, str) or not model.strip():
+        return openai_error_response("Missing required parameter: model", 400)
+
+    request_model = RequestModel(
+        model=model.strip(),
+        messages=[Message(role="user", content="")],
+        stream=False,
+    )
+
+    model_handler = get_model_handler()
+    return await model_handler.request_model(
+        request_model,
+        api_index,
+        background_tasks,
+        endpoint=request.url.path,
+        dialect_id="openai-responses",
+        original_payload=native_body,
+        original_headers=dict(request.headers),
+        passthrough_only=True,
+    )
+
+
 # ============================================================
 # 注册
 # ============================================================
@@ -555,6 +599,17 @@ def register() -> None:
                     tags=["Responses"],
                     summary="Create Response",
                     description="创建响应请求，兼容 OpenAI Responses API 格式（GPT-5/o1/o3 等新模型）",
+                ),
+                # POST /v1/responses/* - Responses 子端点通配透传入口
+                EndpointDefinition(
+                    path="/v1/responses/{subpath:path}",
+                    passthrough_root="/v1/responses",
+                    methods=["POST"],
+                    handler=responses_subpath_handler,
+                    tags=["Responses"],
+                    summary="Responses Passthrough Subpaths",
+                    description="OpenAI Responses API 子端点透传入口（仅在上游为 openai-responses 时可用）",
+                    passthrough_only=True,
                 ),
             ],
         )

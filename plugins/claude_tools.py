@@ -62,8 +62,10 @@ SUPPORTED_SUFFIXES = {
 # 默认的 thinking budget tokens
 DEFAULT_THINKING_BUDGET = 16384
 
-# thinking 后缀的正则（支持 -thinking 和 -thinking-N 格式）
-THINKING_PATTERN = re.compile(r"-thinking(?:-(\d+))?$", re.IGNORECASE)
+# thinking 后缀正则（支持 -thinking / -thinking-N / -thinking-{effort} 格式）
+# effort 级别: max, xhigh, high, medium, low
+THINKING_PATTERN = re.compile(r"-thinking(?:-(\d+|max|xhigh|high|medium|low))?$", re.IGNORECASE)
+_VALID_EFFORTS = {"max", "xhigh", "high", "medium", "low"}
 
 
 def parse_model_suffixes(model: str) -> Tuple[str, Set[str], Optional[int]]:
@@ -95,8 +97,13 @@ def parse_model_suffixes(model: str) -> Tuple[str, Set[str], Optional[int]]:
         thinking_match = THINKING_PATTERN.search(remaining)
         if thinking_match:
             enabled_features.add("thinking")
-            if thinking_match.group(1):
-                thinking_budget = int(thinking_match.group(1))
+            param = thinking_match.group(1)
+            if param and param.lower() in _VALID_EFFORTS:
+                # effort 级别名 — 存负数作为标记，apply 时识别
+                thinking_budget = -1  # 哨兵值，表示用 effort 名
+                enabled_features.add(f"effort:{param.lower()}")
+            elif param:
+                thinking_budget = int(param)
             else:
                 thinking_budget = DEFAULT_THINKING_BUDGET
             # 移除 thinking 后缀
@@ -119,48 +126,71 @@ def parse_model_suffixes(model: str) -> Tuple[str, Set[str], Optional[int]]:
 
 def is_claude_engine(engine: str) -> bool:
     """
-    检查是否为 Claude 引擎
-
-    Args:
-        engine: 引擎类型
-
-    Returns:
-        是否为 Claude 引擎
+    检查是否为 Claude 引擎。
+    通过渠道注册表的 type_name 动态判断，不再硬编码白名单。
     """
     if not isinstance(engine, str):
         return False
+    engine_lower = engine.lower()
+    # 直接匹配
+    if engine_lower in ("claude", "anthropic"):
+        return True
+    # 查注册表：type_name 含 "claude" 即视为 Claude 系
+    try:
+        from core.channels.registry import get_channel
+        ch = get_channel(engine_lower)
+        if ch and "claude" in ch.type_name.lower():
+            return True
+    except Exception:
+        pass
+    return False
 
-    claude_engines = {"claude", "anthropic", "vertex-claude", "aws"}
-    return engine.lower() in claude_engines
+
+def _needs_legacy_thinking(model: str) -> bool:
+    """判断模型是否只支持旧版 enabled + budget_tokens 格式。
+    
+    Claude 3.x 系列只支持 type: enabled。
+    4.x 及以后全部支持 adaptive，直接用 adaptive + effort。
+    """
+    model_lower = model.lower() if model else ""
+    return "claude-3" in model_lower
 
 
-def apply_thinking_config(payload: Dict[str, Any], budget_tokens: int) -> None:
+def apply_thinking_config(payload: Dict[str, Any], budget_tokens: int, model: str = "") -> None:
     """
     应用 thinking 配置到 payload
 
-    Claude 原生 thinking 格式：
-    {
-        "thinking": {
-            "type": "enabled",
-            "budget_tokens": 10240
-        }
-    }
+    Claude 4.x+: thinking.type = "adaptive" + output_config.effort
+    Claude 3.x: thinking.type = "enabled" + budget_tokens
 
     Args:
         payload: 请求 payload
         budget_tokens: thinking budget tokens
+        model: 模型名，用于判断用哪种格式
     """
-    payload["thinking"] = {
-        "type": "enabled",
-        "budget_tokens": budget_tokens
-    }
+    if not _needs_legacy_thinking(model):
+        # Claude 4.x+ 统一用 adaptive + effort
+        payload["thinking"] = {"type": "adaptive"}
+        # 从 features 里找 effort 级别，没有则默认 max
+        effort = "max"
+        features = payload.pop("_thinking_features", None) or set()
+        for f in features:
+            if f.startswith("effort:"):
+                effort = f.split(":", 1)[1]
+                break
+        payload.setdefault("output_config", {})["effort"] = effort
+        logger.debug(f"[claude_tools] Applied adaptive thinking: effort={effort}")
+    else:
+        payload["thinking"] = {
+            "type": "enabled",
+            "budget_tokens": budget_tokens
+        }
+        logger.debug(f"[claude_tools] Applied thinking config: budget_tokens={budget_tokens}")
 
     # thinking 模式要求 temperature=1，且不能有 top_p/top_k
     payload["temperature"] = 1
     payload.pop("top_p", None)
     payload.pop("top_k", None)
-
-    logger.debug(f"[claude_tools] Applied thinking config: budget_tokens={budget_tokens}")
 
 
 def apply_tool_config(payload: Dict[str, Any], tool_type: str) -> None:
@@ -189,9 +219,9 @@ def apply_tool_config(payload: Dict[str, Any], tool_type: str) -> None:
     # 注意：type 必须包含版本日期后缀
     tool_mapping = {
         "search": {
-            "type": "web_search_20250305",
+            "type": "web_search_20260209",
             "name": "web_search",
-            "max_uses": 5,  # 限制每次请求最多搜索次数
+            "max_uses": 5,
         },
         "code": {
             "type": "code_execution_20250522",
@@ -217,6 +247,13 @@ def apply_tool_config(payload: Dict[str, Any], tool_type: str) -> None:
         if tool_config["type"] not in existing_types:
             payload["tools"].append(tool_config.copy())
             logger.debug(f"[claude_tools] Added server tool: {tool_config['type']}")
+
+        # web_search_20260209 的 dynamic filtering 依赖 code_execution
+        if tool_type == "search":
+            code_type = tool_mapping["code"]["type"]
+            if code_type not in existing_types:
+                payload["tools"].append(tool_mapping["code"].copy())
+                logger.debug(f"[claude_tools] Auto-added code_execution for dynamic filtering")
 
 
 def update_anthropic_beta_header(headers: Dict[str, Any], features: Set[str]) -> None:
@@ -288,9 +325,10 @@ async def claude_tools_request_interceptor(
     # 更新模型名（去除后缀）
     payload["model"] = base_model
 
-    # 应用 thinking 配置
-    if "thinking" in features and thinking_budget:
-        apply_thinking_config(payload, thinking_budget)
+    # 应用 thinking 配置（尊重用户 overrides —— payload 里已有 thinking 则跳过）
+    if "thinking" in features and thinking_budget and "thinking" not in payload:
+        payload["_thinking_features"] = features  # 传 effort 级别给 apply_thinking_config
+        apply_thinking_config(payload, thinking_budget, model=base_model)
 
     # 应用工具配置
     for feature in features:

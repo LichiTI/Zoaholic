@@ -9,7 +9,8 @@ from fastapi import HTTPException
 from fastapi.encoders import jsonable_encoder
 from collections import defaultdict
 from typing import List, Dict, Optional
-from ruamel.yaml import YAML, YAMLError
+import yaml as _pyyaml
+from yaml import YAMLError
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import select, func, case
@@ -48,11 +49,19 @@ class InMemoryRateLimiter:
         self.requests[key].append(now)
         return False
 
-from ruamel.yaml.scalarstring import DoubleQuotedScalarString
+class _YamlHelper:
+    """PyYAML CSafe wrapper — drop-in for the old ruamel YAML() instance."""
+    def load(self, source):
+        if hasattr(source, 'read'):
+            return _pyyaml.load(source, Loader=_pyyaml.CSafeLoader)
+        return _pyyaml.load(source, Loader=_pyyaml.CSafeLoader)
 
-yaml = YAML()
-yaml.preserve_quotes = True
-yaml.indent(mapping=2, sequence=4, offset=2)
+    def dump(self, data, stream):
+        _pyyaml.dump(data, stream, Dumper=_pyyaml.CSafeDumper,
+                     allow_unicode=True, default_flow_style=False,
+                     sort_keys=False)
+
+yaml = _YamlHelper()
 
 # 配置文件路径：
 # - 默认使用项目根目录（utils.py 所在目录）下的 api.yaml，避免受启动 cwd 影响
@@ -60,6 +69,43 @@ yaml.indent(mapping=2, sequence=4, offset=2)
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 API_YAML_PATH = os.path.abspath(os.getenv("API_YAML_PATH") or os.path.join(_BASE_DIR, "api.yaml"))
 yaml_error_message = None
+
+
+def _rebuild_api_with_labels(provider: dict) -> None:
+    """将运行时 _api_labels 还原到 api 列表中，用于持久化。
+    
+    有 label 的 key 存成 {key: label} dict，没 label 的保持纯字符串。
+    disabled key 保留 ! 前缀。
+    """
+    labels = provider.get("_api_labels")
+    if not labels or not isinstance(labels, dict):
+        return
+    api = provider.get("api")
+    if not api:
+        return
+    
+    raw_list = [api] if isinstance(api, str) else list(api) if isinstance(api, list) else []
+    rebuilt = []
+    for item in raw_list:
+        # 跳过已经是 dict 的（不应该出现在运行时 config，但防御性处理）
+        if isinstance(item, dict):
+            rebuilt.append(item)
+            continue
+        key_str = str(item).strip()
+        # 提取纯 key（去掉 ! 前缀）
+        is_disabled = key_str.startswith("!")
+        clean_key = key_str[1:] if is_disabled else key_str
+        label = labels.get(clean_key)
+        if label:
+            persist_key = f"!{clean_key}" if is_disabled else clean_key
+            rebuilt.append({persist_key: label})
+        else:
+            rebuilt.append(key_str)
+    
+    if len(rebuilt) == 1 and isinstance(rebuilt[0], str):
+        provider["api"] = rebuilt[0]
+    else:
+        provider["api"] = rebuilt
 
 
 def _sanitize_config_for_persistence(config_data: dict) -> dict:
@@ -72,6 +118,10 @@ def _sanitize_config_for_persistence(config_data: dict) -> dict:
     import copy
 
     processed_data = copy.deepcopy(config_data or {})
+
+    # 持久化前还原 label 到 api 列表
+    for provider in processed_data.get("providers", []) or []:
+        _rebuild_api_with_labels(provider)
 
     # 过滤掉子渠道展开生成的 provider（运行时产物，不持久化）
     processed_data['providers'] = [
@@ -247,20 +297,10 @@ async def load_config_from_db() -> Optional[dict]:
 
 def _quote_colon_strings(obj):
     """
-    递归处理配置数据，对包含冒号的纯字符串进行引号包裹，
-    避免 YAML 将其解析为键值对。
+    递归处理配置数据（历史兼容 no-op）。
+    PyYAML CSafeDumper 会自动给含冒号的字符串加引号，无需手动处理。
     """
-    if isinstance(obj, str):
-        # 如果字符串包含冒号，使用双引号包裹
-        if ':' in obj:
-            return DoubleQuotedScalarString(obj)
-        return obj
-    elif isinstance(obj, dict):
-        return {k: _quote_colon_strings(v) for k, v in obj.items()}
-    elif isinstance(obj, list):
-        return [_quote_colon_strings(item) for item in obj]
-    else:
-        return obj
+    return obj
 
 def save_api_yaml(config_data):
     """将配置持久化到 api.yaml。
@@ -463,7 +503,7 @@ def _expand_sub_channels(providers: list) -> list:
     return expanded
 
 
-async def update_config(config_data, use_config_url=False, skip_model_fetch=False, save_to_file=True, save_to_db: bool = False):
+async def update_config(config_data, use_config_url=False, skip_model_fetch=False, save_to_file=True, save_to_db: bool = False, changed_providers=None):
     # 修改原因：/v1/api_config/update 可以只保存 preferences，此时传入的是已经包含运行时子渠道的 app.state.config。
     # 修改方式：展开子渠道前先移除 _is_sub_channel 运行时 provider，再从主渠道重新展开。
     # 目的：避免多次保存全局设置后，子渠道在运行时 providers 中重复累积。
@@ -498,23 +538,43 @@ async def update_config(config_data, use_config_url=False, skip_model_fetch=Fals
                 # 跳过后面的 circular list 创建
                 provider_api = None
 
-        if provider_api:
+        if provider_api and (changed_providers is None or provider['provider'] in changed_providers):
             # 解析 API key 列表，支持 ! 前缀标记禁用的 key
             # 格式：正常 key 直接使用，以 ! 开头的 key 表示禁用
             def parse_api_keys(api_list):
-                """解析 API key 列表，返回 (items, disabled_keys)"""
+                """解析 API key 列表，返回 (items, disabled_keys, labels)
+                
+                支持三种元素格式：
+                - str: "sk-xxx" 或 "!sk-xxx"(禁用)
+                - dict: {"sk-xxx": "label"} 或 {"!sk-xxx": "label"}(禁用+label)
+                - int: 自动转 str
+                """
                 items = []
                 disabled_keys = set()
+                labels = {}
                 for key in api_list:
-                    key_str = str(key).strip()
-                    if key_str.startswith('!'):
-                        # 禁用的 key：去掉 ! 前缀，加入禁用集合
-                        clean_key = key_str[1:]
-                        items.append(clean_key)
-                        disabled_keys.add(clean_key)
+                    # dict 格式: {"sk-xxx": "label"}
+                    if isinstance(key, dict) and len(key) == 1:
+                        raw_key, label = next(iter(key.items()))
+                        key_str = str(raw_key).strip()
+                        if key_str.startswith('!'):
+                            clean_key = key_str[1:]
+                            items.append(clean_key)
+                            disabled_keys.add(clean_key)
+                        else:
+                            clean_key = key_str
+                            items.append(clean_key)
+                        if label and str(label).strip():
+                            labels[clean_key] = str(label).strip()
                     else:
-                        items.append(key_str)
-                return items, disabled_keys
+                        key_str = str(key).strip()
+                        if key_str.startswith('!'):
+                            clean_key = key_str[1:]
+                            items.append(clean_key)
+                            disabled_keys.add(clean_key)
+                        else:
+                            items.append(key_str)
+                return items, disabled_keys, labels
             
             # 保存旧实例的自动禁用状态，用于热重载后恢复
             old_circular = provider_api_circular_list.get(provider['provider'])
@@ -526,7 +586,9 @@ async def update_config(config_data, use_config_url=False, skip_model_fetch=Fals
                 old_auto_cooling = {k: old_circular.cooling_until[k] for k in old_auto_disabled}
 
             if isinstance(provider_api, str):
-                items, disabled_keys = parse_api_keys([provider_api])
+                items, disabled_keys, labels = parse_api_keys([provider_api])
+                if labels:
+                    provider.setdefault('_api_labels', {}).update(labels)
                 provider_api_circular_list[provider['provider']] = ThreadSafeCircularList(
                     items=items,
                     rate_limit=safe_get(provider, "preferences", "api_key_rate_limit", default={"default": "999999/min"}),
@@ -535,7 +597,9 @@ async def update_config(config_data, use_config_url=False, skip_model_fetch=Fals
                     disabled_keys=disabled_keys
                 )
             if isinstance(provider_api, list):
-                items, disabled_keys = parse_api_keys(provider_api)
+                items, disabled_keys, labels = parse_api_keys(provider_api)
+                if labels:
+                    provider.setdefault('_api_labels', {}).update(labels)
                 provider_api_circular_list[provider['provider']] = ThreadSafeCircularList(
                     items=items,
                     rate_limit=safe_get(provider, "preferences", "api_key_rate_limit", default={"default": "999999/min"}),
@@ -877,6 +941,14 @@ def apply_custom_headers(headers: dict, custom_headers: dict) -> None:
         return
     for k, v in custom_headers.items():
         if v is None:
+            continue
+        # 值为 "null" 字符串时删除该 header（用于屏蔽渠道硬编码的头）
+        if isinstance(v, str) and v.strip().lower() == "null":
+            key_lower = str(k).lower()
+            for existing_key in list(headers.keys()):
+                if str(existing_key).lower() == key_lower:
+                    del headers[existing_key]
+                    break
             continue
         _set_header_case_insensitive(headers, k, v)
 

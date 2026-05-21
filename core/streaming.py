@@ -103,10 +103,114 @@ class LoggingStreamingResponse(Response):
             if "start_time" in self.current_info:
                 process_time = time() - self.current_info["start_time"]
                 self.current_info["process_time"] = process_time
+            # sticky_ip: 200 + 0 completion_tokens = 流内报错/空响应，清 session 让下次 round_robin 重新分配
+            try:
+
+                if (
+                    self.current_info.get("status_code") == 200
+                    and self.current_info.get("completion_tokens", 0) == 0
+                    and self.current_info.get("success")
+                    and self.app
+                ):
+                    # 从流内容提取错误信息（精确解析给日志展示用）
+                    stream_error_msg = self._extract_stream_error()
+                    # raw body 给 key_rules 关键词匹配用（不依赖硬编码解析）
+                    raw_body = self.current_info.get("response_body", "") or ""
+                    if isinstance(raw_body, bytes):
+                        raw_body = raw_body.decode("utf-8", errors="replace")
+
+                    # 标记为 "假200" — 流建立但无有效输出
+                    self.current_info["status_code"] = 502
+                    self.current_info["success"] = False
+                    self.current_info["error_message"] = stream_error_msg or "Stream completed with 0 output tokens (possible in-stream error)"
+                    logger.warning(
+                        f"[stream_guard] {self.current_info.get('provider', '?')} "
+                        f"200→502: 0 completion_tokens, error={stream_error_msg!r}"
+                    )
+
+                    from core.utils import provider_api_circular_list
+                    channel_id = self.current_info.get("provider", "")
+
+                    # key_rules 匹配用 raw body（关键词在任何层级 JSON 里都能命中）
+                    try:
+                        from core.key_rules import resolve_key_rules, match_key_rules
+                        provider_cfg = self.current_info.get("_provider_cfg")
+                        if provider_cfg and channel_id:
+                            _key_rules = resolve_key_rules(provider_cfg.get("preferences") or {})
+                            if _key_rules:
+                                _rule = match_key_rules(_key_rules, 502, raw_body)
+                                if _rule:
+                                    current_api = self.current_info.get("_used_api_key", "")
+                                    clist = provider_api_circular_list.get(channel_id)
+                                    if clist and current_api:
+                                        _duration = _rule.get("duration", 0)
+                                        _reason = f"stream_guard:{_rule.get('reason', 'key_rule')}"
+                                        if _duration == -1:
+                                            await clist.set_auto_disabled(current_api, duration=0, reason=_reason)
+                                        elif _duration > 0:
+                                            await clist.set_auto_disabled(current_api, duration=_duration, reason=_reason)
+                                        logger.info(f"[stream_guard] key_rule matched: {_reason}, duration={_duration}, key={current_api[:12]}...")
+                    except Exception as e:
+                        logger.debug(f"[stream_guard] key_rules failed: {e}")
+
+                    # sticky_ip: 清 session
+                    clist = provider_api_circular_list.get(channel_id)
+                    if clist and clist.schedule_algorithm == "sticky_ip":
+                        client_ip = self.current_info.get("client_ip", "")
+                        if client_ip and client_ip in clist._sticky_sessions:
+                            clist._sticky_sessions.pop(client_ip, None)
+            except Exception:
+                pass
+
             try:
                 await update_stats(self.current_info, app=self.app)
             except Exception as e:
                 logger.error(f"Error updating stats in LoggingStreamingResponse: {str(e)}")
+
+    def _extract_stream_error(self) -> str:
+        """从 current_info 的 response_body 中提取错误信息。
+        
+        尝试解析 SSE error event 和 JSON error 对象。
+        返回错误消息字符串，没找到则返回空字符串。
+        """
+        body = self.current_info.get("response_body", "")
+        if not body:
+            return ""
+        if isinstance(body, bytes):
+            body = body.decode("utf-8", errors="replace")
+        
+        # 尝试从 SSE 事件中提取 error
+        import re
+        for match in re.finditer(r'data:\s*({.+?})\s*(?:\n|$)', body):
+            try:
+                obj = json.loads(match.group(1))
+                if isinstance(obj, dict):
+                    # OpenAI Responses API: {"type":"error","error":{"type":"...","message":"..."}}
+                    err = obj.get("error")
+                    if isinstance(err, dict) and err.get("message"):
+                        return err["message"]
+                    # Standard SSE error
+                    if obj.get("type") == "error" and obj.get("message"):
+                        return obj["message"]
+            except (json.JSONDecodeError, TypeError):
+                continue
+        
+        # 尝试整体 JSON
+        try:
+            obj = json.loads(body)
+            if isinstance(obj, dict):
+                err = obj.get("error")
+                if isinstance(err, dict) and err.get("message"):
+                    return err["message"]
+                if isinstance(err, str):
+                    return err
+        except (json.JSONDecodeError, TypeError):
+            pass
+        
+        # 截取前 200 字符作为兜底
+        if len(body) < 500:
+            return body[:200]
+        return ""
 
     def _try_extract_usage(self, resp: dict) -> None:
         """从已解析的 JSON 对象中提取 usage 并合并到 current_info。
@@ -262,6 +366,19 @@ class LoggingStreamingResponse(Response):
                 self.current_info["response_body"] = await asyncio.to_thread(truncate_for_logging, response_body)
             except Exception as e:
                 logger.error(f"Error saving response body: {str(e)}")
+
+        # 非 SSE 响应（如 Gemini 非流式透传）的 usage 提取：
+        # _try_parse_line 只能解析 SSE 格式（按行 data: {json}），
+        # 纯 JSON 响应按行切分后每行都不是完整 JSON，导致 usage 漏采。
+        # 流结束后如果 completion_tokens 仍为 0，尝试把完整响应体当 JSON 解析。
+        if self.current_info.get("completion_tokens", 0) == 0 and response_chunks:
+            try:
+                full_body = b"".join(response_chunks).decode("utf-8", errors="replace")
+                full_resp = json.loads(full_body)
+                if isinstance(full_resp, dict):
+                    self._try_extract_usage(full_resp)
+            except Exception:
+                pass
 
     async def close(self) -> None:
         if not self._closed:
