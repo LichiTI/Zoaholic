@@ -426,6 +426,9 @@ async def get_channels(token: str = Depends(verify_admin_api_key)):
     返回每个渠道的 id, type_name, default_base_url, auth_header, description, has_models_adapter。
     """
     channels = list_channels()
+    # 修改原因：渠道元数据中的 ui_slots 现在需要包含独立注册表叠加后的 resolved slots。
+    # 修改方式：继续调用 ChannelDefinition.to_dict()，由渠道定义层统一执行 resolve_slots_for_engine。
+    # 目的：保持 /v1/channels 端点结构不变，同时让前端获得 P1 阶段可解析的全局 slot。
     channel_list = [ch.to_dict() for ch in channels]
     return JSONResponse(content={"channels": channel_list})
 
@@ -563,17 +566,25 @@ async def fetch_channel_models(
 
         with proxy_context(proxy):
             async with app.state.client_manager.get_client(provider["base_url"], proxy) as client:
-                # 包装 client，让请求拦截器能作用于 models_adapter 的请求
-                enabled_plugins = safe_get(provider, "preferences", "enabled_plugins", default=None)
-                if enabled_plugins:
-                    from core.plugins.interceptors import InterceptedClient
-                    client = InterceptedClient(client, engine, provider, enabled_plugins)
+                intercepted_client = None
+                try:
+                    # 修改原因：InterceptedClient 会持有底层 client、provider 和插件列表，必须在请求结束时断开引用。
+                    # 修改方式：保存包装器实例，并在 finally 中调用 close；业务代码仍使用 client 变量。
+                    # 目的：让 models 查询完成或异常中断后都释放包装器持有的请求级对象。
+                    enabled_plugins = safe_get(provider, "preferences", "enabled_plugins", default=None)
+                    if enabled_plugins:
+                        from core.plugins.interceptors import InterceptedClient
+                        intercepted_client = InterceptedClient(client, engine, provider, enabled_plugins)
+                        client = intercepted_client
 
-                models = await asyncio.wait_for(
-                    channel.models_adapter(client, provider),
-                    timeout=30.0
-                )
-                return JSONResponse(content={"models": models})
+                    models = await asyncio.wait_for(
+                        channel.models_adapter(client, provider),
+                        timeout=30.0
+                    )
+                    return JSONResponse(content={"models": models})
+                finally:
+                    if intercepted_client is not None:
+                        intercepted_client.close()
     except Exception as e:
         # 尽量提取并返回上游的错误信息
         upstream_status = None
@@ -856,7 +867,7 @@ def _coerce_oauth_percent(value: Any) -> Optional[float]:
 
 def _oauth_quota_to_balance_result(quota: Any, error: Optional[str] = None) -> Dict[str, Any]:
     """把 OAuthManager.fetch_quota 的返回值转换为前端现有 BalanceResult 形状。"""
-    # 修改原因：前端余额展示读取 value_type、percent、available 等通用字段，而 OAuth quota 使用 quota_5h/quota_7d。
+    # 修改原因：前端余额展示读取 value_type、percent、available 等通用字段，而 OAuth quota 使用 quota_inner/quota_outer。
     # 修改方式：保留 OAuth 原字段，同时用两个窗口中的最低剩余额度作为兼容的 percent 和 available。
     # 目的：OAuth 渠道可以复用 /v1/channels/balance 和现有余额展示，不要求用户配置 endpoint/mapping。
     if error or not isinstance(quota, dict):
@@ -867,15 +878,15 @@ def _oauth_quota_to_balance_result(quota: Any, error: Optional[str] = None) -> D
             "used": None,
             "available": None,
             "percent": None,
-            "quota_5h": None,
-            "quota_7d": None,
+            "quota_inner": None,
+            "quota_outer": None,
             "raw": None,
             "error": error or "OAuth 额度不可用",
         }
 
-    quota_5h = _coerce_oauth_percent(quota.get("quota_5h"))
-    quota_7d = _coerce_oauth_percent(quota.get("quota_7d"))
-    percentages = [pct for pct in (quota_5h, quota_7d) if pct is not None]
+    quota_inner = _coerce_oauth_percent(quota.get("quota_inner"))
+    quota_outer = _coerce_oauth_percent(quota.get("quota_outer"))
+    percentages = [pct for pct in (quota_inner, quota_outer) if pct is not None]
     percent = min(percentages) if percentages else None
     total = 100.0 if percent is not None else None
     used = round(100.0 - percent, 10) if percent is not None else None
@@ -894,12 +905,39 @@ def _oauth_quota_to_balance_result(quota: Any, error: Optional[str] = None) -> D
         "used": used,
         "available": percent,
         "percent": percent,
-        "quota_5h": quota_5h,
-        "quota_7d": quota_7d,
+        "quota_inner": quota_inner,
+        "quota_outer": quota_outer,
         **extra,
         "raw": quota.get("raw") if isinstance(quota.get("raw"), dict) else None,
         "error": None,
     }
+
+
+def _append_quota_snapshot_fields(result: Dict[str, Any]) -> Dict[str, Any]:
+    """在旧 BalanceResult 响应上追加 QuotaSnapshot 新字段。"""
+    # 修改原因：/v1/channels/balance 需要继续返回旧字段，同时让前端可以开始读取统一 quota 字段。
+    # 修改方式：在所有返回分支末尾把旧结果转成 QuotaSnapshot，只追加 gauges、badges、metrics、extensions 四类新字段。
+    # 目的：不改变现有余额查询逻辑和旧字段含义，降低 P0 接入风险。
+    if not isinstance(result, dict):
+        return result
+
+    from core.quota.normalizers import from_balance_result, from_oauth_account
+
+    balance_snapshot = from_balance_result(result)
+    if result.get("quota_inner") is not None or result.get("quota_outer") is not None:
+        snapshot = from_oauth_account(result)
+        snapshot.badges.extend(balance_snapshot.badges)
+        if not snapshot.gauges:
+            snapshot.gauges.extend(balance_snapshot.gauges)
+    else:
+        snapshot = balance_snapshot
+
+    snapshot_fields = snapshot.to_dict()
+    merged = dict(result)
+    for key, default in (("gauges", []), ("badges", []), ("metrics", {}), ("extensions", {})):
+        if merged.get(key) is None:
+            merged[key] = snapshot_fields.get(key, default.copy())
+    return merged
 
 
 def _aggregate_oauth_balance_results(results: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
@@ -915,8 +953,8 @@ def _aggregate_oauth_balance_results(results: Dict[str, Dict[str, Any]]) -> Dict
             "used": None,
             "available": None,
             "percent": None,
-            "quota_5h": None,
-            "quota_7d": None,
+            "quota_inner": None,
+            "quota_outer": None,
             "raw": None,
             "error": "未配置 OAuth 账号标识",
             "results": {},
@@ -944,8 +982,8 @@ def _aggregate_oauth_balance_results(results: Dict[str, Dict[str, Any]]) -> Dict
         "used": used,
         "available": percent,
         "percent": percent,
-        "quota_5h": None,
-        "quota_7d": None,
+        "quota_inner": None,
+        "quota_outer": None,
         "raw": results,
         "error": None if has_success else "OAuth 额度不可用",
         "results": results,
@@ -1045,7 +1083,7 @@ async def query_channel_balance(
         from core.plugins.interceptors import apply_balance_enrichers
         enabled_plugins = safe_get(provider_config, "preferences", "enabled_plugins", default=None)
         result = await apply_balance_enrichers(result, engine, provider, enabled_plugins)
-        return JSONResponse(content=result)
+        return JSONResponse(content=_append_quota_snapshot_fields(result))
 
     from core.balance import query_provider_balance, build_balance_config
 
@@ -1060,16 +1098,16 @@ async def query_channel_balance(
             fallback = await apply_balance_enrichers(fallback, engine, provider, enabled_plugins)
             # enricher 补了有效字段（如 tier）就返回，否则返回提示
             if any(k not in ("supported", "value_type", "raw", "error") for k in fallback):
-                return JSONResponse(content=fallback)
+                return JSONResponse(content=_append_quota_snapshot_fields(fallback))
             # 有插件但缓存还没数据，提示用户发请求触发采集
-            return JSONResponse(content={
+            return JSONResponse(content=_append_quota_snapshot_fields({
                 "supported": True,
                 "error": "尚未采集到数据，请先通过该渠道发送一次请求",
-            })
-        return JSONResponse(content={
+            }))
+        return JSONResponse(content=_append_quota_snapshot_fields({
             "supported": False,
             "error": "该渠道未配置余额查询（preferences.balance）",
-        })
+        }))
 
     # 验证 base_url
     base_url = provider.get("base_url", "")
@@ -1089,29 +1127,37 @@ async def query_channel_balance(
         with proxy_context(proxy):
             target_url = provider.get("base_url") or "https://localhost"
             async with app.state.client_manager.get_client(target_url, proxy) as client:
-                # 插件拦截器（和 fetch_models 同样的逻辑）
-                enabled_plugins = safe_get(provider, "preferences", "enabled_plugins", default=None)
-                if enabled_plugins:
-                    from core.plugins.interceptors import InterceptedClient
-                    client = InterceptedClient(client, engine, provider, enabled_plugins)
+                intercepted_client = None
+                try:
+                    # 修改原因：余额查询路径也会创建 InterceptedClient，异常返回时同样需要释放引用。
+                    # 修改方式：将包装器生命周期限定在 try/finally 中，并在 finally 调用 close。
+                    # 目的：避免余额查询结束后继续持有底层 client、provider 和插件配置。
+                    enabled_plugins = safe_get(provider, "preferences", "enabled_plugins", default=None)
+                    if enabled_plugins:
+                        from core.plugins.interceptors import InterceptedClient
+                        intercepted_client = InterceptedClient(client, engine, provider, enabled_plugins)
+                        client = intercepted_client
 
-                result = await query_provider_balance(client, provider)
-                # 修改原因：普通渠道的余额查询返回后需要允许插件补充 OpenAI Tier 等被动信息。
-                # 修改方式：复用上方已解析的 enabled_plugins，对 result 调用 balance_enricher 链。
-                # 目的：不改 core.balance 模板，也能把 oai_tier 缓存的信息带回前端。
-                from core.plugins.interceptors import apply_balance_enrichers
-                result = await apply_balance_enrichers(result, engine, provider, enabled_plugins)
-                return JSONResponse(content=result)
+                    result = await query_provider_balance(client, provider)
+                    # 修改原因：普通渠道的余额查询返回后需要允许插件补充 OpenAI Tier 等被动信息。
+                    # 修改方式：复用上方已解析的 enabled_plugins，对 result 调用 balance_enricher 链。
+                    # 目的：不改 core.balance 模板，也能把 oai_tier 缓存的信息带回前端。
+                    from core.plugins.interceptors import apply_balance_enrichers
+                    result = await apply_balance_enrichers(result, engine, provider, enabled_plugins)
+                    return JSONResponse(content=_append_quota_snapshot_fields(result))
+                finally:
+                    if intercepted_client is not None:
+                        intercepted_client.close()
 
     except Exception as e:
         logger.error(f"Balance query error: {e}")
         return JSONResponse(
             status_code=200,
-            content={
+            content=_append_quota_snapshot_fields({
                 "supported": True,
                 "error": f"查询失败: {str(e)}"[:500],
                 "raw": None,
-            },
+            }),
         )
 
 

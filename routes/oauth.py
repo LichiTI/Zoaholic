@@ -101,15 +101,15 @@ def _oauth_error_page(title: str, message: str, status_code: int = 400) -> HTMLR
     return HTMLResponse(f"<h2>{safe_title}</h2><p>{safe_message}</p>", status_code=status_code)
 
 
-def _oauth_success_page(key_id: str, state: str, provider: str) -> HTMLResponse:
+def _oauth_success_page(key_id: str, state: str, provider: str, already_exists: bool = False) -> HTMLResponse:
     """生成 OAuth 成功提示页，并通知前端窗口刷新账号列表。"""
-    # 修改原因：callback 页面需要把新增账号标识和渠道名传回管理前端，但 key_id/provider 不能直接拼进脚本字符串。
+    # 修改原因：callback 页面需要把新增账号标识和渠道名传回管理前端，but key_id/provider 不能直接拼进脚本字符串。
     # 修改方式：HTML 展示部分使用 html.escape，postMessage 载荷先用 json.dumps 序列化，再转义脚本敏感字符。
     # 目的：完成弹窗登录闭环，同时避免账号字符串中的特殊字符破坏 HTML、JavaScript 或 script 标签边界。
     safe_key_id = html.escape(key_id)
     message_payload = (
         json.dumps(
-            {"type": "oauth_callback_success", "key_id": key_id, "state": state, "provider": provider},
+            {"type": "oauth_callback_success", "key_id": key_id, "state": state, "provider": provider, "already_exists": already_exists},
             ensure_ascii=False,
         )
         .replace("&", "\\u0026")
@@ -151,6 +151,107 @@ def _token_data_from_body(body: dict) -> dict:
     # 修改方式：复制 body 中除 key_id、type、provider、service_account_json 之外的字段。
     # 目的：让手动导入同时支持 refresh_token、access_token、id_token 等凭据字段，同时不污染凭据内容。
     return {k: v for k, v in body.items() if k not in {"key_id", "type", "provider", "service_account_json"}}
+
+
+def _key_exists_in_provider(app, channel_id: str, key_id: str) -> bool:
+    """检查 key_id 是否已存在于指定渠道的 api 列表中。
+
+    用于 OAuth 导入/登录时判断是否需要追加新行。
+    支持 api 列表中的纯字符串、带 ! 前缀和 dict(带 label) 三种格式。
+    """
+    providers = (getattr(getattr(app, 'state', None), 'config', None) or {}).get('providers', [])
+    for p in providers:
+        if not isinstance(p, dict):
+            continue
+        if p.get('provider') != channel_id:
+            continue
+        api_list = p.get('api', [])
+        if isinstance(api_list, str):
+            api_list = [api_list]
+        if not isinstance(api_list, list):
+            break
+        for item in api_list:
+            if isinstance(item, dict) and len(item) == 1:
+                raw_key = str(next(iter(item.keys()))).strip()
+                clean = raw_key[1:] if raw_key.startswith('!') else raw_key
+            elif isinstance(item, str):
+                clean = item.strip()[1:] if item.strip().startswith('!') else item.strip()
+            else:
+                continue
+            if clean == key_id:
+                return True
+        break
+    return False
+
+
+def _replace_api_key_id_entry(item, old_key_id: str, new_key_id: str):
+    """替换 api 列表中的一个 key_id 条目。"""
+    # 修改原因：OAuth key 可能以普通字符串、!禁用字符串或带备注 dict 三种格式保存在 api.yaml。
+    # 修改方式：统一解析出干净 key_id，命中旧 key 时只替换 key 部分，并保留禁用前缀和备注值。
+    # 目的：账号改名同步 api.yaml 时不破坏用户设置的禁用状态和 Key 备注。
+    if isinstance(item, dict) and len(item) == 1:
+        raw_key, label = next(iter(item.items()))
+        raw_key = str(raw_key).strip()
+        disabled = raw_key.startswith("!")
+        clean_key = raw_key[1:] if disabled else raw_key
+        if clean_key != old_key_id:
+            return item, False
+        replaced_key = f"!{new_key_id}" if disabled else new_key_id
+        return {replaced_key: label}, True
+
+    if isinstance(item, str):
+        raw_key = item.strip()
+        disabled = raw_key.startswith("!")
+        clean_key = raw_key[1:] if disabled else raw_key
+        if clean_key != old_key_id:
+            return item, False
+        return f"!{new_key_id}" if disabled else new_key_id, True
+
+    return item, False
+
+
+async def _sync_provider_api_key_rename(app, channel_id: str, old_key_id: str, new_key_id: str) -> bool:
+    """把 OAuth 账号改名同步到当前 provider 的 api 配置并持久化。"""
+    # 修改原因：rename API 原先只更新 OAuthManager state，api.yaml 中 provider.api 仍保留旧 key_id。
+    # 修改方式：在 app.state.config.providers 中定位当前 provider，替换 api 字段里的旧 key，并复用 admin 的持久化流程写回配置。
+    # 目的：用户在 OAuth Key 输入框失焦改名后，不需要再手动保存渠道也能让 api.yaml 与 oauth_state.json 保持一致。
+    config = getattr(getattr(app, "state", None), "config", None)
+    if not isinstance(config, dict):
+        return False
+    providers = config.get("providers")
+    if not isinstance(providers, list):
+        return False
+
+    changed = False
+    for provider in providers:
+        if not isinstance(provider, dict):
+            continue
+        provider_name = str(provider.get("provider") or provider.get("name") or "").strip()
+        if provider_name != channel_id:
+            continue
+
+        api_value = provider.get("api")
+        if isinstance(api_value, list):
+            replaced_items = []
+            for item in api_value:
+                replaced, item_changed = _replace_api_key_id_entry(item, old_key_id, new_key_id)
+                replaced_items.append(replaced)
+                changed = changed or item_changed
+            if changed:
+                provider["api"] = replaced_items
+        elif isinstance(api_value, str) or (isinstance(api_value, dict) and len(api_value) == 1):
+            replaced, changed = _replace_api_key_id_entry(api_value, old_key_id, new_key_id)
+            if changed:
+                provider["api"] = replaced
+        break
+
+    if not changed:
+        return False
+
+    from routes.admin import _persist_config
+
+    await _persist_config(app, sections_to_verify=["providers"], changed_providers={channel_id})
+    return True
 
 
 def _require_provider_name(value: str | None) -> str | None:
@@ -283,8 +384,9 @@ async def oauth_exchange(request: Request):
     # 目的：让前端 manual exchange 登录和 auto callback 登录都能注册为当前渠道下的 OAuthManager key_id。
     email = str(token_data.get("email") or "").strip()
     key_id = email or f"oauth_{secrets.token_hex(4)}"
+    already_exists = _key_exists_in_provider(request.app, channel_id, key_id)
     await oauth_mgr.register(channel_id, key_id, flow["type"], token_data)
-    return {"message": "Account registered", "key_id": key_id}
+    return {"message": "Account registered", "key_id": key_id, "already_exists": already_exists}
 
 
 @router.get("/v1/oauth/callback")
@@ -341,8 +443,9 @@ async def oauth_callback(code: str, state: str, request: Request):
     # 目的：让 callback 登录和手动导入都能最终注册为当前渠道下可解析的 key_id。
     email = str(token_data.get("email") or "").strip()
     key_id = email or f"oauth_{secrets.token_hex(4)}"
+    already_exists = _key_exists_in_provider(request.app, channel_id, key_id)
     await oauth_mgr.register(channel_id, key_id, flow["type"], token_data)
-    return _oauth_success_page(key_id, state, channel_id)
+    return _oauth_success_page(key_id, state, channel_id, already_exists=already_exists)
 
 
 @router.post("/v1/oauth/import", dependencies=[Depends(verify_admin_api_key)])
@@ -405,11 +508,13 @@ async def import_account(request: Request):
                 updated = await oauth_provider.refresh_token(token_data)
             email = updated.get("email")
             final_key_id = email if email else key_id
+            already_exists = _key_exists_in_provider(request.app, channel_id, final_key_id)
             await oauth_mgr.register(channel_id, final_key_id, type_name, updated)
-            return {"message": "Account imported", "key_id": final_key_id}
+            return {"message": "Account imported", "key_id": final_key_id, "already_exists": already_exists}
         else:
+            already_exists = _key_exists_in_provider(request.app, channel_id, key_id)
             await oauth_mgr.register(channel_id, key_id, type_name, token_data)
-            return {"message": "Account imported", "key_id": key_id}
+            return {"message": "Account imported", "key_id": key_id, "already_exists": already_exists}
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=400)
 
@@ -471,7 +576,36 @@ async def rename_account(key_id: str, request: Request):
         else:
             status_code = 400
         return JSONResponse({"error": message}, status_code=status_code)
+    # 修改原因：OAuthManager.rename 只会迁移 oauth_state.json，当前渠道 api 列表仍会引用旧账号名。
+    # 修改方式：rename 成功后立即同步 app.state.config.providers 中的 api 条目，并复用配置持久化流程写回 api.yaml。
+    # 目的：前端失焦改名后无需再手动保存渠道，配置文件和 OAuth state 即可保持一致。
+    await _sync_provider_api_key_rename(request.app, channel_id, key_id, new_key_id)
     return {"message": "Account renamed", "old_key_id": key_id, "new_key_id": new_key_id}
+
+
+@router.post("/v1/oauth/copy-provider", dependencies=[Depends(verify_admin_api_key)])
+async def copy_provider_oauth_state(request: Request):
+    """
+    复制 OAuth state：把 source_provider 下所有账号的 OAuth state 复制到 target_provider 下。
+    Body: { "source_provider": "原渠道名", "target_provider": "新渠道名" }
+    """
+    # 修改原因：复制渠道只复制 api.yaml 中的账号 key，不会复制 OAuthManager 内部按 provider 分层保存的 token state。
+    # 修改方式：校验 source_provider 与 target_provider 后，调用 OAuthManager.copy_channel_state 做 provider 级深拷贝。
+    # 目的：让复制出来的 OAuth 渠道保存后可以立即使用原渠道账号，不再因缺少 token state 返回 401。
+    body = await request.json()
+    source_provider = _require_provider_name(body.get("source_provider"))
+    target_provider = _require_provider_name(body.get("target_provider"))
+    if not source_provider:
+        return JSONResponse({"error": "source_provider is required"}, status_code=400)
+    if not target_provider:
+        return JSONResponse({"error": "target_provider is required"}, status_code=400)
+
+    await request.app.state.oauth_manager.copy_channel_state(source_provider, target_provider)
+    return {
+        "message": "OAuth state copied",
+        "source_provider": source_provider,
+        "target_provider": target_provider,
+    }
 
 
 @router.delete("/v1/oauth/accounts/{key_id}", dependencies=[Depends(verify_admin_api_key)])

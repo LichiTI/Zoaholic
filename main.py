@@ -1,3 +1,4 @@
+import gc
 import os
 import json
 import asyncio
@@ -44,6 +45,10 @@ from core.stats import (
 from core.plugins import get_plugin_manager
 
 DEFAULT_TIMEOUT = int(os.getenv("TIMEOUT", 600))
+# 修改原因：SSE 流式响应在上游长时间思考/检索/排队时需要应用层心跳，不能依赖 TCP/Nginx keepalive。
+# 修改方式：为 keepalive_interval 提供可环境变量覆盖的合理默认值，配置文件仍可按全局/渠道/模型覆盖。
+# 目的：默认每 15 秒向下游发送 SSE 注释帧，避免客户端或中间代理因空闲无字节而断开。
+DEFAULT_KEEPALIVE_INTERVAL = int(os.getenv("KEEPALIVE_INTERVAL", 15))
 # DEBUG 环境变量支持 true/false/1/0/yes/no
 is_debug = env_bool("DEBUG", False)
 logger.info("DISABLE_DATABASE: %s", DISABLE_DATABASE)
@@ -59,17 +64,20 @@ logger.info("VERSION: %s", VERSION)
 
 def init_preference(all_config, preference_key, default_timeout=DEFAULT_TIMEOUT):
     # 存储超时配置
-    preference_dict = {}
+    # 修改原因：旧逻辑在 preferences 为空或未声明某项偏好时，会让 global 默认值变成空 dict，
+    # 后续调用方若传入兜底值就可能覆盖启动期 default_timeout（keepalive 因此默认落到 99999 并被禁用）。
+    # 修改方式：先写入 default_timeout，再叠加配置文件中的全局/模型级覆盖。
+    # 目的：让 model_timeout、keepalive_interval 等偏好都稳定遵守启动期默认值，同时保留现有覆盖语义。
+    preference_dict = {"default": default_timeout}
     preferences = safe_get(all_config, "preferences", default={})
     providers = safe_get(all_config, "providers", default=[])
     if preferences:
         if isinstance(preferences.get(preference_key), int):
             preference_dict["default"] = preferences.get(preference_key)
         else:
-            for model_name, timeout_value in preferences.get(preference_key, {"default": default_timeout}).items():
+            preference_settings = preferences.get(preference_key, {}) or {}
+            for model_name, timeout_value in preference_settings.items():
                 preference_dict[model_name] = timeout_value
-            if "default" not in preferences.get(preference_key, {}):
-                preference_dict["default"] = default_timeout
 
     result = defaultdict(lambda: defaultdict(lambda: default_timeout))
     for provider in providers:
@@ -390,6 +398,12 @@ def _register_oauth_providers_from_registry(oauth_manager) -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # gen2 GC 调优：降低触发频率但不完全禁用
+    # 默认 (700,10,10) 导致 gen2 频繁触发 stop-the-world 20~30s
+    # 改为 (700,50,50)：gen2 触发频率降 5 倍，减少卡顿但仍能回收循环引用
+    gc.set_threshold(700, 50, 50)
+    logger.info(f"[GC] Tuned thresholds={gc.get_threshold()}")
+
     # 启动时的代码
     # 设置各模块的调试模式
     set_routing_debug_mode(is_debug)
@@ -476,7 +490,7 @@ async def lifespan(app: FastAPI):
                     app.state.admin_api_key = [app.state.api_keys_db[0].get("api")]
 
         app.state.provider_timeouts = init_preference(app.state.config, "model_timeout", DEFAULT_TIMEOUT)
-        app.state.keepalive_interval = init_preference(app.state.config, "keepalive_interval", 99999)
+        app.state.keepalive_interval = init_preference(app.state.config, "keepalive_interval", DEFAULT_KEEPALIVE_INTERVAL)
         # 初始化 models_list（用于存储从其他 API Key 引用的模型列表）
         app.state.models_list = {}
         # pprint(dict(app.state.provider_timeouts))
@@ -628,9 +642,67 @@ async def lifespan(app: FastAPI):
 
     asyncio.get_running_loop().create_task(daily_maintenance())
 
+    # 定期 malloc_trim：强制 glibc 归还 free 了但没还给 OS 的内存
+    # Python 大字符串（请求/响应体）释放后 pymalloc 标记为可用但 RSS 不降，
+    # malloc_trim(0) 让 glibc 把空闲页还给 OS，降低 RSS
+    try:
+        import ctypes
+        _libc = ctypes.CDLL("libc.so.6")
+        _has_malloc_trim = hasattr(_libc, 'malloc_trim')
+    except Exception:
+        _libc = None
+        _has_malloc_trim = False
+
+    async def memory_maintenance():
+        """每 5 分钟 malloc_trim + 凌晨 4 点 gen2 GC"""
+        tick = 0
+        while True:
+            await asyncio.sleep(300)  # 5 分钟
+            tick += 1
+
+            # malloc_trim 每轮都做
+            if _has_malloc_trim:
+                try:
+                    _libc.malloc_trim(0)
+                    if tick % 12 == 1:  # 每小时日志一次
+                        logger.info("[memory_maintenance] malloc_trim(0) executed")
+                except Exception as e:
+                    logger.warning(f"[memory_maintenance] malloc_trim failed: {e}")
+
+            # 凌晨 4 点做一次 gen2 GC
+            now = datetime.now(timezone(timedelta(hours=8)))  # CST
+            if now.hour == 4 and now.minute < 5:
+                try:
+                    before = gc.get_count()
+                    collected = gc.collect()
+                    after = gc.get_count()
+                    logger.info(f"[memory_maintenance] gen2 collect done: freed {collected} objects, counts {before} -> {after}")
+                    if _has_malloc_trim:
+                        _libc.malloc_trim(0)
+                except Exception as e:
+                    logger.warning(f"[memory_maintenance] gc.collect() failed: {e}")
+
+    asyncio.get_running_loop().create_task(memory_maintenance())
+
+    # 启动完成，删除热重载标记文件（通知 monitor 服务已恢复）
+    _reload_marker = os.path.join(os.path.dirname(__file__), 'data', '.reloading')
+    try:
+        os.remove(_reload_marker)
+    except FileNotFoundError:
+        pass
+
     app.state.startup_completed = True
     yield
     # 关闭时的代码
+    # 写热重载标记文件（通知 monitor 跳过检查）
+    try:
+        os.makedirs(os.path.dirname(_reload_marker), exist_ok=True)
+        with open(_reload_marker, 'w') as f:
+            f.write(str(os.getpid()))
+        logger.info("[lifespan] Wrote .reloading marker for health monitor")
+    except Exception:
+        pass
+
     # 取消清理任务
     if cleanup_task:
         cleanup_task.cancel()

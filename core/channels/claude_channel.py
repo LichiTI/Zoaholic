@@ -529,6 +529,22 @@ async def fetch_claude_response(client, url, headers, payload, model, timeout):
     if content or reasoning_content or tool_calls_list:
         mark_content_start()
 
+    # 如果非流式直接触发拒绝，因为没有半路断联问题，直接 400 报错拦截最为安全，100% 杜绝 Agent 误读
+    if response_json.get("stop_reason") == "refusal":
+        stop_details = response_json.get("stop_details") or {}
+        refusal_reason = (
+            stop_details.get("explanation")
+            or stop_details.get("type")
+            or stop_details.get("category")
+            or "This request triggered Claude safeguards and was refused."
+        )
+        yield {
+            "error": f"This request triggered Claude safeguards and was refused: {refusal_reason}",
+            "status_code": 400,
+            "details": f"Claude Refusal ({stop_details.get('category', 'unknown')})"
+        }
+        return
+
     role = safe_get(response_json, "role")
 
     yield await generate_no_stream_response(
@@ -581,6 +597,33 @@ async def fetch_claude_response_stream(client, url, headers, payload, model, tim
                                 + cache_creation_tokens
                                 + cached_tokens
                             )
+                    # 处理 message_delta 中的拒绝回答（Refusal）信号
+                    # 必须在 usage 处理和 break 之前检查，否则 refusal 会被跳过
+                    delta_for_refusal = safe_get(resp, "delta", default={})
+                    if delta_for_refusal.get("stop_reason") == "refusal":
+                        stop_details = delta_for_refusal.get("stop_details", {})
+                        refusal_reason = (
+                            stop_details.get("explanation")
+                            or stop_details.get("type")
+                            or stop_details.get("category")
+                            or "This request triggered Claude safeguards and was refused."
+                        )
+                        mark_content_start()
+                        sse_content_filter = await generate_sse_response(
+                            timestamp, model, content=f"\n[Safeguards Refusal] {refusal_reason}\n", stop="content_filter"
+                        )
+                        yield sse_content_filter
+                        err_payload = {
+                            "error": {
+                                "message": f"This request triggered Claude safeguards and was refused: {refusal_reason}",
+                                "type": "invalid_request_error",
+                                "param": None,
+                                "code": "content_filter"
+                            }
+                        }
+                        yield f"data: {json_dumps_text(err_payload, ensure_ascii=False)}\n\n"
+                        # refusal 后仍然需要写 usage 再 break
+
                     output_tokens = safe_get(resp, "usage", "output_tokens", default=0)
                     if output_tokens:
                         total_tokens = input_tokens + output_tokens
