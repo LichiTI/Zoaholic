@@ -94,3 +94,4 @@ test/
 !frontend/test/**frontend/test/
 .limcode/
 tests/
+/plugins
