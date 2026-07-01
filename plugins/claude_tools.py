@@ -37,14 +37,27 @@ from core.plugins import (
 # 插件元信息
 PLUGIN_INFO = {
     "name": "claude_tools",
-    "version": "1.0.0",
-    "description": "Claude 后缀工具插件 — 在模型名后追加 -thinking/-search/-code/-computer/-artifacts/-fast 等后缀，自动注入对应的原生 Claude API 参数。后缀可自由组合，如 claude-sonnet-4-thinking-fast。",
+    "version": "1.1.0",
+    "description": "Claude 后缀工具 + 自动缓存。模型名后缀 -thinking/-search/-code/-fast 等自动注入 API 参数；cache 参数自动注入 prompt caching（客户端已带则跳过）。",
     "author": "Zoaholic Team",
     "dependencies": [],
     "metadata": {
         "category": "interceptors",
-        "tags": ["claude", "anthropic", "thinking", "tools"],
-        "params_hint": "无需参数。后缀直接写在模型名后: -thinking[-N] / -search / -code / -computer / -artifacts",
+        "tags": ["claude", "anthropic", "thinking", "tools", "cache"],
+        "params_hint": "cache=5m | cache=1h（自动注入 prompt caching，客户端自带则跳过）。模型后缀无需在此配置，直接写在模型名后即可。",
+        "params_schema": [
+            {
+                "key": "cache",
+                "label": "Prompt Caching",
+                "type": "select",
+                "options": [
+                    {"value": "", "label": "不启用"},
+                    {"value": "5m", "label": "5 分钟 (写入1.25x, 读取0.1x)"},
+                    {"value": "1h", "label": "1 小时 (写入2x, 读取0.1x)"},
+                ],
+                "default": "",
+            },
+        ],
     },
 }
 
@@ -132,12 +145,13 @@ def is_claude_engine(engine: str) -> bool:
     """
     检查是否为 Claude 引擎。
     通过渠道注册表的 type_name 动态判断，不再硬编码白名单。
+    AWS Bedrock 跑的也是 Claude，需要识别。
     """
     if not isinstance(engine, str):
         return False
     engine_lower = engine.lower()
     # 直接匹配
-    if engine_lower in ("claude", "anthropic"):
+    if engine_lower in ("claude", "anthropic", "aws"):
         return True
     # 查注册表：type_name 含 "claude" 即视为 Claude 系
     try:
@@ -253,15 +267,60 @@ def apply_tool_config(payload: Dict[str, Any], tool_type: str) -> None:
             payload["tools"].append(tool_config.copy())
             logger.debug(f"[claude_tools] Added server tool: {tool_config['type']}")
 
-        # web_search_20260209 的 dynamic filtering 依赖 code_execution
-        if tool_type == "search":
-            code_tool = tool_mapping["code"]
-            # 重新检查当前 tools 列表（可能上面刚 append 了）
-            current_types = {t.get("type") for t in payload["tools"] if isinstance(t, dict)}
-            current_names = {t.get("name") for t in payload["tools"] if isinstance(t, dict)}
-            if code_tool["type"] not in current_types and code_tool.get("name") not in current_names:
-                payload["tools"].append(code_tool.copy())
-                logger.debug(f"[claude_tools] Auto-added code_execution for dynamic filtering")
+        # web_search_20260209 内置 dynamic filtering，API 会自动注入 code_execution
+        # 不需要也不应该手动添加，否则与 API 自动注入的或客户端已有的冲突
+        # 参考：https://platform.claude.com/docs/en/agents-and-tools/tool-use/tool-reference
+
+
+def _has_cache_control(payload: Dict[str, Any]) -> bool:
+    """检测请求体里是否已有 cache_control（客户端自己管缓存）。"""
+    # 顶层
+    if "cache_control" in payload:
+        return True
+    # system 里
+    system = payload.get("system")
+    if isinstance(system, list):
+        for block in system:
+            if isinstance(block, dict) and "cache_control" in block:
+                return True
+    # messages 里
+    for msg in payload.get("messages", []):
+        if isinstance(msg, dict):
+            if "cache_control" in msg:
+                return True
+            content = msg.get("content")
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and "cache_control" in block:
+                        return True
+    # tools 里
+    for tool in payload.get("tools", []):
+        if isinstance(tool, dict) and "cache_control" in tool:
+            return True
+    return False
+
+
+def _inject_auto_cache(payload: Dict[str, Any], provider: Dict[str, Any]) -> None:
+    """自动注入顶层 cache_control，走 Anthropic 自动缓存。客户端自带则跳过。"""
+    if _has_cache_control(payload):
+        return
+    # 从 provider preferences 的 enabled_plugins 参数读 TTL
+    # 格式：claude_tools:cache=1h 或 claude_tools:cache=5m
+    ttl = None
+    for plugin_entry in provider.get("preferences", {}).get("enabled_plugins", []):
+        if isinstance(plugin_entry, str) and plugin_entry.startswith("claude_tools"):
+            for part in plugin_entry.split(":")[1:]:
+                if part.startswith("cache="):
+                    ttl = part[6:]  # "1h" 或 "5m"
+                    break
+            break
+    if not ttl:
+        return  # 没配 cache 参数，不注入
+    cc = {"type": "ephemeral"}
+    if ttl == "1h":
+        cc["ttl"] = "1h"
+    payload["cache_control"] = cc
+    logger.debug(f"[claude_tools] Injected auto cache_control: {cc}")
 
 
 def update_anthropic_beta_header(headers: Dict[str, Any], features: Set[str]) -> None:
@@ -300,6 +359,25 @@ def update_anthropic_beta_header(headers: Dict[str, Any], features: Set[str]) ->
         headers["anthropic-beta"] = ",".join(beta_features)
 
 
+# ==================== 辅助：模型名提取 ====================
+
+def _extract_model_from_url(url: str) -> str:
+    """从 Bedrock 风格 URL 提取模型名: .../model/{model_id}/invoke..."""
+    if "/model/" not in url:
+        return ""
+    try:
+        return url.split("/model/")[1].split("/")[0]
+    except (IndexError, ValueError):
+        return ""
+
+
+def _replace_model_in_url(url: str, old: str, new: str) -> str:
+    """替换 URL 中的模型名段"""
+    if old and new and old != new and old in url:
+        return url.replace(old, new, 1)
+    return url
+
+
 # ==================== 请求拦截器 ====================
 
 async def claude_tools_request_interceptor(
@@ -314,46 +392,59 @@ async def claude_tools_request_interceptor(
     """
     Claude Tools 请求拦截器
 
-    处理 -thinking/-search/-code 等后缀的模型请求
+    处理 -thinking/-search/-code 等后缀的模型请求。
+    支持两种渠道格式：
+      - 标准 Claude：model 在 payload 里
+      - AWS Bedrock：model 在 URL 路径里（payload 不含 model 字段）
     """
-    model = payload.get("model", "")
-
-    # 早期退出：不是 Claude 引擎
     if not is_claude_engine(engine):
         return url, headers, payload
 
-    # 解析后缀
-    base_model, features, thinking_budget = parse_model_suffixes(model)
+    # ── 1. 确定 model 来源 ──
+    is_aws = (engine.lower() == "aws")
+    url_model = _extract_model_from_url(url) if is_aws else ""
 
-    # 早期退出：没有识别到任何后缀
+    if is_aws:
+        # AWS: payload 没有 model 字段，从 URL 取
+        model = url_model
+    else:
+        # 标准 Claude: 从 payload 取
+        model = payload.get("model", "")
+
+    if not model:
+        return url, headers, payload
+
+    # ── 2. 解析后缀 ──
+    base_model, features, thinking_budget = parse_model_suffixes(model)
     if not features:
         return url, headers, payload
 
-    logger.info(f"[claude_tools] Processing model: {model}, features: {features}")
+    logger.info(f"[claude_tools] model={model}, features={features}, engine={engine}")
 
-    # 更新模型名（去除后缀）
-    payload["model"] = base_model
+    # ── 3. 剥后缀：payload 和 URL 各管各的 ──
+    if is_aws:
+        # AWS: 只改 URL 里的模型名，payload 没有 model 字段
+        url = _replace_model_in_url(url, url_model, base_model)
+    else:
+        # 标准 Claude: 改 payload 里的 model
+        payload["model"] = base_model
 
-    # 应用 thinking 配置（尊重用户 overrides —— payload 里已有 thinking 则跳过）
+    # ── 4. 注入功能配置 ──
     if "thinking" in features and thinking_budget and "thinking" not in payload:
-        payload["_thinking_features"] = features  # 传 effort 级别给 apply_thinking_config
+        payload["_thinking_features"] = features
         apply_thinking_config(payload, thinking_budget, model=base_model)
 
-    # 应用 fast mode
     if "fast" in features:
         payload["speed"] = "fast"
-        logger.debug("[claude_tools] Enabled fast mode: speed=fast")
 
-    # 应用工具配置
     for feature in features:
-        if feature not in ("thinking", "fast"):
+        if feature not in ("thinking", "fast") and not feature.startswith("effort:"):
             apply_tool_config(payload, feature)
 
-    # 更新 anthropic-beta header
     update_anthropic_beta_header(headers, features)
 
-    logger.debug(f"[claude_tools] Modified payload model: {payload['model']}, "
-                 f"thinking: {'thinking' in features}, tools: {payload.get('tools', [])}")
+    # ── 5. 自动 prompt caching ──
+    _inject_auto_cache(payload, provider)
 
     return url, headers, payload
 

@@ -1,31 +1,23 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
-import { type KeyboardEvent } from 'react';
+import { type KeyboardEvent, useState, useRef, useEffect } from 'react';
 import * as Dialog from '@radix-ui/react-dialog';
 import * as Switch from '@radix-ui/react-switch';
 import {
   Plus, Edit, Brain, Trash2, ArrowRight, RefreshCw,
   Server, X, CheckCircle2, Settings2, Copy, ToggleRight, ToggleLeft,
-  Folder, Puzzle, Network, CopyCheck, Power, Play,
+  Folder, Puzzle, Network, CopyCheck, Play,
   Check, Wallet, Link2, GripVertical, ChevronUp, ChevronDown,
-  ClipboardPaste, LogIn, Download, LayoutList, LayoutGrid
+  ClipboardPaste, LogIn, Download, LayoutList, LayoutGrid, MoreHorizontal, Package, FileUp
 } from 'lucide-react';
 import { InterceptorSheet } from '../../../components/InterceptorSheet';
 import { ProviderLogo } from '../../../components/ProviderLogos';
-import {
-  formatKeyRuleKeywordsInput,
-  formatKeyRuleStatusInput,
-  getKeyRuleRetryMode,
-  parseKeyRuleKeywordsInput,
-  parseKeyRuleStatusInput,
-  setKeyRuleRetryMode,
-  type KeyRuleRetryMode,
-} from '../../../lib/keyRules';
+import { PipelineView } from './PipelineView';
 import { summarizeVirtualChain } from '../../../lib/virtualModels';
 import { apiFetch } from '../../../lib/api';
 import { toastError, fmtErr } from '../../../components/Toast';
 import type { ChannelOption } from '../types';
 import { SCHEDULE_ALGORITHMS, getBalancePercent, hasUiSlot } from '../utils';
-import { DeferredInput, RackCard, RackGrid, UiSlot } from './KeyComponents';
+import { RackCard, RackGrid, UiSlot } from './KeyComponents';
 import { FullKeyRow } from './FullKeyRow';
 
 import type { UseChannelEditorResult } from '../hooks/useChannelEditor';
@@ -56,6 +48,43 @@ export function ChannelEditor({ state }: ChannelEditorProps) {
     setForceListMode, runtimeKeyStatus, localCountdowns, globalModelPrice, token, importPlaceholder, setImportModalIdx, setImportToken,
     setOauthManualState, setManualUrl, refreshKeyStatus,
   } = state;
+
+  const [keyMoreMenuOpen, setKeyMoreMenuOpen] = useState(false);
+  const [batchImportOpen, setBatchImportOpen] = useState(false);
+  const [batchPasteOpen, setBatchPasteOpen] = useState(false);
+  const [batchJsonText, setBatchJsonText] = useState('');
+  const [batchPasteText, setBatchPasteText] = useState('');
+  const [batchPasteSep, setBatchPasteSep] = useState('newline');
+  const [customSep, setCustomSep] = useState('');
+  const [batchImportResult, setBatchImportResult] = useState<any>(null);
+  const [batchImportLoading, setBatchImportLoading] = useState(false);
+  const [batchImportError, setBatchImportError] = useState('');
+  const keyMoreMenuRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!keyMoreMenuOpen) return;
+    const handler = (e: MouseEvent) => {
+      if (keyMoreMenuRef.current && !keyMoreMenuRef.current.contains(e.target as Node)) setKeyMoreMenuOpen(false);
+    };
+    document.addEventListener('mousedown', handler);
+    return () => document.removeEventListener('mousedown', handler);
+  }, [keyMoreMenuOpen]);
+
+  useEffect(() => {
+    // 修改原因：余额查询已改为纯手动触发，打开编辑面板时不能再静默请求后端余额接口。
+    // 修改方式：面板打开且存在 provider 时，只从 localStorage 读取最近一次手动查询缓存并写回 balanceResults。
+    // 目的：保留余额显示缓存，同时避免打开面板产生自动网络请求。
+    if (isModalOpen && formData?.provider) {
+      const cacheKey = `zoaholic_balance_${formData.provider}`;
+      const cached = localStorage.getItem(cacheKey);
+      if (cached) {
+        try {
+          const { results: cachedResults } = JSON.parse(cached);
+          setBalanceResults(cachedResults);
+        } catch { /* ignore */ }
+      }
+    }
+  }, [isModalOpen, formData?.provider]);
+
   return (
     <>
       {/* Editor Side Sheet - Responsive */}
@@ -219,7 +248,7 @@ export function ChannelEditor({ state }: ChannelEditorProps) {
                       </span>
                     </div>
                     <div className="flex items-center gap-3 text-xs text-muted-foreground">
-                      <span>共 <span className="font-mono text-foreground">{formData.api_keys.filter(k => !k.disabled).length}</span>/{formData.api_keys.length} 个可用 Key</span>
+                      <span>共 <span className="font-mono text-foreground">{formData.api_keys.filter(k => !k.disabled && k.key.trim()).length}</span>/{formData.api_keys.filter(k => k.key.trim()).length} 个可用 Key</span>
                       <button
                         onClick={() => openKeyTestDialog(null, {
                           engine: formData.engine || 'openai',
@@ -242,15 +271,15 @@ export function ChannelEditor({ state }: ChannelEditorProps) {
                     <span className="flex items-center gap-2">
                       <Settings2 className="w-4 h-4 text-emerald-500" /> API Keys
                       {formData.api_keys.length > 0 && (() => {
-                        const cfgEnabled = formData.api_keys.filter(k => !k.disabled).length;
+                        const cfgEnabled = formData.api_keys.filter(k => !k.disabled && k.key.trim()).length;
                         const rtCount = runtimeKeyStatus[formData.provider]?.auto_disabled?.length || 0;
                         const eff = Math.max(0, cfgEnabled - rtCount);
                         const issue = formData.api_keys.some(k => k.disabled) || rtCount > 0;
-                        return <span className={`text-xs font-normal font-mono px-1.5 py-0.5 rounded ${issue ? 'bg-orange-500/10 text-orange-600 dark:text-orange-400' : 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-500'}`}>{eff}/{formData.api_keys.length}</span>;
+                        return <span className={`text-xs font-normal font-mono px-1.5 py-0.5 rounded ${issue ? 'bg-orange-500/10 text-orange-600 dark:text-orange-400' : 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-500'}`}>{eff}/{formData.api_keys.filter(k => k.key.trim()).length}</span>;
                       })()}
                     </span>
                     <div className="flex items-center gap-2 text-xs">
-                      <button onClick={copyAllKeys} className="text-muted-foreground hover:text-foreground flex items-center gap-1"><Copy className="w-3 h-3" /> 复制全部</button>
+                      <button onClick={addEmptyKey} className="text-primary hover:text-primary/80 flex items-center gap-1"><Plus className="w-3 h-3" /> 添加密钥</button>
                       <button
                         onClick={() => queryAllBalances()}
                         disabled={balanceLoading}
@@ -289,15 +318,22 @@ export function ChannelEditor({ state }: ChannelEditorProps) {
                       >
                         <Play className="w-3 h-3" /> 多key测试
                       </button>
-                      <button
-                        onClick={clearAllKeys}
-                        disabled={formData.api_keys.length === 0}
-                        className="text-red-600 dark:text-red-500 hover:text-red-700 dark:hover:text-red-400 flex items-center gap-1 disabled:opacity-50 disabled:cursor-not-allowed"
-                        title="一键清空该渠道的全部密钥"
-                      >
-                        <Trash2 className="w-3 h-3" /> 清空
-                      </button>
-                      <button onClick={addEmptyKey} className="text-primary hover:text-primary/80 flex items-center gap-1"><Plus className="w-3 h-3" /> 添加密钥</button>
+                      <div ref={keyMoreMenuRef} className="relative">
+                        <button
+                          type="button"
+                          onClick={(e) => { e.stopPropagation(); setKeyMoreMenuOpen(prev => !prev); }}
+                          className="text-muted-foreground hover:text-foreground rounded p-0.5"
+                          title="更多操作"
+                        >
+                          <MoreHorizontal className="w-3.5 h-3.5" />
+                        </button>
+                        {keyMoreMenuOpen && (
+                          <div className="absolute right-0 top-full z-20 mt-1 min-w-[120px] bg-card border border-border rounded-lg shadow-lg p-1">
+                            <button type="button" onClick={() => { copyAllKeys(); setKeyMoreMenuOpen(false); }} className="w-full px-3 py-1.5 hover:bg-muted rounded text-xs flex items-center gap-2 text-left text-foreground"><Copy className="w-3 h-3" /> 复制全部</button>
+                            <button type="button" onClick={() => { clearAllKeys(); setKeyMoreMenuOpen(false); }} disabled={formData.api_keys.length === 0} className="w-full px-3 py-1.5 hover:bg-muted rounded text-xs flex items-center gap-2 text-left text-red-600 dark:text-red-500 disabled:opacity-50"><Trash2 className="w-3 h-3" /> 清空</button>
+                          </div>
+                        )}
+                      </div>
                       {formData.api_keys.length >= 12 && (
                         <button
                           onClick={() => { setForceListMode(prev => !prev); setFocusedKeyIdx(null); }}
@@ -378,6 +414,17 @@ export function ChannelEditor({ state }: ChannelEditorProps) {
                             />
                           );
                         })}
+                        <div
+                          className="relative h-[92px] overflow-hidden rounded-lg border border-dashed border-border/60 bg-card/50 text-foreground transition-all duration-200 hover:border-primary/40 flex flex-col items-center justify-center gap-1.5"
+                          style={{ width: 'calc((100% - 5 * 6px) / 6)' }}
+                        >
+                          <button type="button" onClick={addEmptyKey} className="flex items-center gap-1 rounded px-2 py-1 text-[10px] text-primary hover:bg-muted"><Plus className="w-3 h-3" /> 添加</button>
+                          {isOAuthEngine ? (
+                            <button type="button" onClick={() => { setBatchImportOpen(true); setBatchPasteOpen(false); }} className="flex items-center gap-1 rounded px-2 py-1 text-[10px] text-muted-foreground hover:bg-muted hover:text-primary"><Package className="w-3 h-3" /> 导入</button>
+                          ) : (
+                            <button type="button" onClick={() => { setBatchPasteOpen(true); setBatchImportOpen(false); }} className="flex items-center gap-1 rounded px-2 py-1 text-[10px] text-muted-foreground hover:bg-muted hover:text-primary"><ClipboardPaste className="w-3 h-3" /> 粘贴</button>
+                          )}
+                        </div>
                       </RackGrid>
                     ) : (
                       <>
@@ -410,11 +457,254 @@ export function ChannelEditor({ state }: ChannelEditorProps) {
                         ))}
                       </>
                     )}
-                    {/* 修改原因：BYOK provider 现在必须在密钥列表中显式填写 "*"，空列表不再表示 BYOK。 */}
-                    {/* 修改方式：把空状态提示改为提醒管理员新增 "*" 作为 BYOK 标记。 */}
-                    {/* 目的：避免管理员误以为空密钥仍会启用 BYOK 模式。 */}
-                    {formData.api_keys.length === 0 && <div className="text-center p-4 text-sm text-muted-foreground italic">暂无密钥。请新增并填写 * 表示 BYOK 模式；空密钥不会启用 BYOK</div>}
+                    {formData.api_keys.length > 0 && (formData.api_keys.length < 12 || forceListMode) && (
+                      <div className="flex justify-center gap-3 pt-2 text-xs">
+                        <button type="button" onClick={addEmptyKey} className="text-primary hover:text-primary/80 flex items-center gap-1"><Plus className="w-3 h-3" /> 添加密钥</button>
+                        {isOAuthEngine ? (
+                          <button type="button" onClick={() => { setBatchImportOpen(true); setBatchPasteOpen(false); }} className="text-muted-foreground hover:text-primary flex items-center gap-1"><Package className="w-3 h-3" /> 批量导入</button>
+                        ) : (
+                          <button type="button" onClick={() => { setBatchPasteOpen(true); setBatchImportOpen(false); }} className="text-muted-foreground hover:text-primary flex items-center gap-1"><ClipboardPaste className="w-3 h-3" /> 批量粘贴</button>
+                        )}
+                      </div>
+                    )}
+                    {formData.api_keys.length === 0 && (
+                      <div className="text-center p-6 space-y-2">
+                        <p className="text-sm text-muted-foreground italic">暂无密钥</p>
+                        <div className="flex justify-center gap-3 text-xs">
+                          <button type="button" onClick={addEmptyKey} className="text-primary hover:text-primary/80 flex items-center gap-1"><Plus className="w-3.5 h-3.5" /> 添加密钥</button>
+                          {isOAuthEngine ? (
+                            <button type="button" onClick={() => { setBatchImportOpen(true); setBatchPasteOpen(false); }} className="text-muted-foreground hover:text-primary flex items-center gap-1"><Package className="w-3.5 h-3.5" /> 批量导入</button>
+                          ) : (
+                            <button type="button" onClick={() => { setBatchPasteOpen(true); setBatchImportOpen(false); }} className="text-muted-foreground hover:text-primary flex items-center gap-1"><ClipboardPaste className="w-3.5 h-3.5" /> 批量粘贴</button>
+                          )}
+                          <button type="button" onClick={() => setFormData(prev => prev ? ({...prev, api_keys: [...prev.api_keys, {key: '*', disabled: false}]}) : prev)} className="text-muted-foreground hover:text-foreground flex items-center gap-1">* BYOK</button>
+                        </div>
+                      </div>
+                    )}
                   </div>
+
+                  {/* OAuth 批量导入面板 */}
+                  {batchImportOpen && isOAuthEngine && (
+                    <div className="mt-3 space-y-3 rounded-lg border border-border bg-muted/30 p-3">
+                      <div className="flex items-center justify-between">
+                        <span className="text-sm font-medium text-foreground">批量导入 OAuth 凭证</span>
+                        <button type="button" onClick={() => { setBatchImportOpen(false); setBatchImportResult(null); setBatchImportError(''); setBatchJsonText(''); }} className="text-muted-foreground hover:text-foreground"><X className="w-4 h-4" /></button>
+                      </div>
+                      <p className="text-xs text-muted-foreground">支持 sub2api 导出 JSON（含 accounts 数组）、CPA 单文件、CPA 多文件数组。也可上传 .json 或 .zip 文件。</p>
+                      <div className="flex gap-2">
+                        <label className="cursor-pointer text-xs text-primary hover:text-primary/80 flex items-center gap-1 border border-border rounded px-2 py-1">
+                          <FileUp className="w-3 h-3" /> 上传文件
+                          <input type="file" accept=".json,.zip" className="hidden" onChange={async (e) => {
+                            const file = e.target.files?.[0];
+                            if (!file) return;
+                            if (file.name.endsWith('.zip')) {
+                              try {
+                                const JSZip = (await import('jszip')).default;
+                                const zip = await JSZip.loadAsync(file);
+                                const jsons: any[] = [];
+                                for (const [name, entry] of Object.entries(zip.files)) {
+                                  if (!name.endsWith('.json') || (entry as any).dir) continue;
+                                  const text = await (entry as any).async('text');
+                                  try { jsons.push(JSON.parse(text)); } catch {}
+                                }
+                                setBatchJsonText(JSON.stringify(jsons, null, 2));
+                              } catch { setBatchImportError('ZIP 解析失败'); }
+                            } else {
+                              const text = await file.text();
+                              setBatchJsonText(text);
+                            }
+                            e.target.value = '';
+                          }} />
+                        </label>
+                      </div>
+                      <textarea
+                        value={batchJsonText}
+                        onChange={e => { setBatchJsonText(e.target.value); setBatchImportResult(null); setBatchImportError(''); }}
+                        placeholder='{"accounts": [...]} 或 [{...}, {...}] 或单个 {"access_token": ...}'
+                        className="w-full h-32 bg-background border border-border rounded-lg px-3 py-2 text-xs font-mono outline-none text-foreground resize-y"
+                      />
+                      {batchJsonText && (() => {
+                        try {
+                          const d = JSON.parse(batchJsonText);
+                          // normalize to preview items
+                          type PreviewItem = { email: string; format: string; hasRefresh: boolean; expiresAt: string; expired: boolean; hasToken: boolean };
+                          const items: PreviewItem[] = [];
+                          const parseOne = (obj: any): PreviewItem => {
+                            if (obj?.credentials) {
+                              // sub2api
+                              const c = obj.credentials;
+                              const exp = c.expires_at ? (typeof c.expires_at === 'number' ? new Date(c.expires_at * 1000).toLocaleString() : String(c.expires_at)) : '-';
+                              const expTs = typeof c.expires_at === 'number' ? c.expires_at * 1000 : (c.expires_at ? Date.parse(c.expires_at) : NaN);
+                              return { email: obj.name || c.email || '未知', format: 'sub2api', hasRefresh: !!c.refresh_token, expiresAt: exp, expired: !isNaN(expTs) && expTs < Date.now(), hasToken: !!c.access_token };
+                            }
+                            // CPA formats
+                            const email = obj?.user?.email || obj?.account?.email_address || obj?.email || '未知';
+                            let fmt = 'unknown';
+                            if (obj?.user?.email) fmt = 'CPA-codex';
+                            else if (obj?.account?.email_address) fmt = 'CPA-claude';
+                            else if (obj?.email && obj?.expiry) fmt = 'CPA-gemini';
+                            else if (obj?.access_token) fmt = 'CPA';
+                            const exp = obj?.expires_at || obj?.expiry || (obj?.expires_in ? `${obj.expires_in}s` : '-');
+                            const expStr = typeof exp === 'number' ? new Date(exp * 1000).toLocaleString() : String(exp);
+                            const expTs = typeof exp === 'number' ? exp * 1000 : (typeof exp === 'string' && exp !== '-' ? Date.parse(exp) : NaN);
+                            return { email, format: fmt, hasRefresh: !!obj?.refresh_token, expiresAt: expStr, expired: !isNaN(expTs) && expTs < Date.now(), hasToken: !!obj?.access_token };
+                          };
+                          if (d?.accounts) { d.accounts.forEach((a: any) => items.push(parseOne(a))); }
+                          else if (Array.isArray(d)) { d.forEach((a: any) => items.push(parseOne(a))); }
+                          else if (d?.access_token) { items.push(parseOne(d)); }
+                          if (items.length === 0) return <p className="text-xs text-amber-600">⚠ 无法识别格式</p>;
+                          const fmtLabel = d?.accounts ? 'sub2api' : Array.isArray(d) ? 'CPA 多文件' : 'CPA 单文件';
+                          return (
+                            <div className="space-y-2">
+                              <p className="text-xs text-emerald-600">✓ {fmtLabel}，共 {items.length} 个账号
+                                {(() => {
+                                  const expired = items.filter(i => i.expired).length;
+                                  const noToken = items.filter(i => !i.hasToken).length;
+                                  const noRefresh = items.filter(i => !i.hasRefresh && !i.expired && i.hasToken).length;
+                                  const valid = items.length - expired - noToken;
+                                  return <span className="ml-2">
+                                    {valid > 0 && <span className="text-emerald-600">{valid} 可用</span>}
+                                    {expired > 0 && <span className="text-red-500 ml-1">{expired} 已过期</span>}
+                                    {noToken > 0 && <span className="text-red-500 ml-1">{noToken} 缺token</span>}
+                                    {noRefresh > 0 && <span className="text-amber-600 ml-1">{noRefresh} 无refresh</span>}
+                                  </span>;
+                                })()}
+                              </p>
+                              <div className="max-h-40 overflow-y-auto text-xs border border-border rounded">
+                                <table className="w-full">
+                                  <thead className="bg-muted/50 sticky top-0"><tr>
+                                    <th className="px-2 py-1 text-left font-medium">#</th>
+                                    <th className="px-2 py-1 text-left font-medium">邮箱/标识</th>
+                                    <th className="px-2 py-1 text-left font-medium">格式</th>
+                                    <th className="px-2 py-1 text-left font-medium">refresh</th>
+                                    <th className="px-2 py-1 text-left font-medium">过期时间</th>
+                                    <th className="px-2 py-1 text-left font-medium">状态</th>
+                                  </tr></thead>
+                                  <tbody>{items.map((it, i) => (
+                                    <tr key={i} className="border-t border-border/50">
+                                      <td className="px-2 py-1 text-muted-foreground">{i+1}</td>
+                                      <td className="px-2 py-1 font-mono truncate max-w-[180px]">{it.email}</td>
+                                      <td className="px-2 py-1">{it.format}</td>
+                                      <td className="px-2 py-1">{it.hasRefresh ? <span className="text-emerald-600">✓</span> : <span className="text-red-500">✗</span>}</td>
+                                      <td className="px-2 py-1 text-muted-foreground">{it.expiresAt}</td>
+                                      <td className="px-2 py-1">{!it.hasToken ? <span className="text-red-500">缺token</span> : it.expired ? <span className="text-red-500">已过期</span> : it.hasRefresh ? <span className="text-emerald-600">可刷新</span> : <span className="text-amber-600">无refresh</span>}</td>
+                                    </tr>
+                                  ))}</tbody>
+                                </table>
+                              </div>
+                            </div>
+                          );
+                        } catch { return <p className="text-xs text-red-500">JSON 格式错误</p>; }
+                      })()}
+                      {batchImportError && <p className="text-xs text-red-500">{batchImportError}</p>}
+                      <div className="flex gap-2">
+                        <button
+                          type="button"
+                          disabled={!batchJsonText.trim() || batchImportLoading}
+                          onClick={async () => {
+                            setBatchImportLoading(true); setBatchImportError(''); setBatchImportResult(null);
+                            try {
+                              const data = JSON.parse(batchJsonText);
+                              const res = await apiFetch('/v1/oauth/batch_import', {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+                                body: JSON.stringify({ provider: formData.provider, type: formData.engine, data }),
+                              });
+                              const json = await res.json();
+                              if (!res.ok) { setBatchImportError(json?.error || '导入失败'); } else { setBatchImportResult(json); refreshOAuthAccounts?.(); }
+                            } catch (err: any) { setBatchImportError(err.message || '请求失败'); }
+                            setBatchImportLoading(false);
+                          }}
+                          className="bg-primary text-primary-foreground px-3 py-1.5 rounded text-xs font-medium disabled:opacity-50"
+                        >{batchImportLoading ? '导入中...' : '开始导入'}</button>
+                      </div>
+                      {batchImportResult && (
+                        <div className="space-y-2">
+                          <p className="text-xs font-medium">结果：✅ {batchImportResult.success} 成功 {batchImportResult.failed > 0 ? `❌ ${batchImportResult.failed} 失败` : ''} {batchImportResult.skipped > 0 ? `⚠️ ${batchImportResult.skipped} 跳过` : ''}</p>
+                          <div className="max-h-40 overflow-y-auto text-xs space-y-1">
+                            {batchImportResult.results?.map((r: any, i: number) => (
+                              <div key={i} className={`flex items-center gap-2 px-2 py-1 rounded ${r.status === 'success' ? 'bg-emerald-500/10' : r.status === 'failed' ? 'bg-red-500/10' : 'bg-amber-500/10'}`}>
+                                <span>{r.status === 'success' ? '✅' : r.status === 'failed' ? '❌' : '⚠️'}</span>
+                                <span className="font-mono truncate flex-1">{r.key_id}</span>
+                                {r.already_exists && <span className="text-amber-600 text-[10px]">已存在</span>}
+                                {r.error && <span className="text-red-500 text-[10px] truncate max-w-[200px]">{r.error}</span>}
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  {/* 普通 Key 批量粘贴面板 */}
+                  {batchPasteOpen && !isOAuthEngine && (
+                    <div className="mt-3 space-y-3 rounded-lg border border-border bg-muted/30 p-3">
+                      <div className="flex items-center justify-between">
+                        <span className="text-sm font-medium text-foreground">批量粘贴 API Key</span>
+                        <button type="button" onClick={() => { setBatchPasteOpen(false); setBatchPasteText(''); }} className="text-muted-foreground hover:text-foreground"><X className="w-4 h-4" /></button>
+                      </div>
+                      <textarea
+                        value={batchPasteText}
+                        onChange={e => setBatchPasteText(e.target.value)}
+                        placeholder="每行一个 Key，或选择其他分隔符"
+                        className="w-full h-28 bg-background border border-border rounded-lg px-3 py-2 text-xs font-mono outline-none text-foreground resize-y"
+                      />
+                      <div className="flex items-center gap-3 text-xs flex-wrap">
+                        <span className="text-muted-foreground">分隔符：</span>
+                        {[['newline','换行'],['comma','逗号'],['semicolon','分号'],['space','空格'],['custom','自定义']].map(([v,l]) => (
+                          <label key={v} className="flex items-center gap-1 cursor-pointer">
+                            <input type="radio" name="sep" value={v} checked={batchPasteSep===v} onChange={() => setBatchPasteSep(v)} className="w-3 h-3" />{l}
+                          </label>
+                        ))}
+                        {batchPasteSep === 'custom' && (
+                          <input
+                            type="text"
+                            value={customSep}
+                            onChange={e => setCustomSep(e.target.value)}
+                            placeholder="输入分隔符"
+                            className="w-16 bg-background border border-border rounded px-1.5 py-0.5 text-xs font-mono outline-none text-foreground"
+                          />
+                        )}
+                      </div>
+                      {batchPasteText && (() => {
+                        const sepMap: Record<string,RegExp> = { newline: /\n/, comma: /,/, semicolon: /;/, space: /\s+/ };
+                        const sep = batchPasteSep === 'custom' && customSep ? new RegExp(customSep.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g') : (sepMap[batchPasteSep] || /\n/);
+                        const rawKeys = batchPasteText.split(sep).map(s => s.trim()).filter(Boolean);
+                        const keys = [...new Set(rawKeys)];
+                        const existingKeys = new Set(formData.api_keys.map(k => k.key));
+                        const newKeys = keys.filter(k => !existingKeys.has(k));
+                        const emptyCount = batchPasteText.split(sep).filter(s => !s.trim()).length;
+                        const dupCount = rawKeys.length - keys.length;
+                        const existCount = keys.length - newKeys.length;
+                        return (
+                          <div className="space-y-1">
+                            <div className="flex items-center justify-between">
+                              <div className="text-xs text-muted-foreground space-x-2">
+                                <span>解析 <span className="font-mono text-foreground">{rawKeys.length}</span> 条</span>
+                                {dupCount > 0 && <span className="text-amber-600">重复 {dupCount}</span>}
+                                {emptyCount > 0 && <span className="text-muted-foreground/60">空行 {emptyCount}</span>}
+                                {existCount > 0 && <span className="text-amber-600">已存在 {existCount}</span>}
+                                <span className="text-emerald-600">有效 <span className="font-mono">{newKeys.length}</span></span>
+                              </div>
+                            <button
+                              type="button"
+                              disabled={newKeys.length === 0}
+                              onClick={() => {
+                                setFormData(prev => prev ? ({
+                                  ...prev,
+                                  api_keys: [...prev.api_keys, ...newKeys.map(k => ({ key: k, disabled: false }))],
+                                }) : prev);
+                                setBatchPasteOpen(false); setBatchPasteText('');
+                              }}
+                              className="bg-primary text-primary-foreground px-3 py-1.5 rounded text-xs font-medium disabled:opacity-50"
+                            >添加 {newKeys.length} 个</button>
+                            </div>
+                          </div>
+                        );
+                      })()}
+                    </div>
+                  )}
+
                   {isOAuthEngine && (
                     <div className="mt-2 flex justify-end">
                       {/* 修改原因：OAuth 凭据需要一个管理员显式导出入口，用于迁移或备份当前渠道。 */}
@@ -855,104 +1145,6 @@ export function ChannelEditor({ state }: ChannelEditorProps) {
                       </div>
                     </div>
 
-                    {/* Key 错误处理规则 */}
-                    <div className="border-t border-border pt-4">
-                      <div className="flex items-center justify-between mb-3">
-                        <label className="text-sm font-medium text-foreground flex items-center gap-1.5">
-                          <Power className="w-3.5 h-3.5 text-red-500" /> Key 错误处理规则
-                        </label>
-                        <div className="flex gap-1.5">
-                          {[{ label: '标准', rules: [
-                            { match: { status: [429] }, duration: 30 },
-                            { match: { status: [401, 403] }, duration: -1 },
-                            { match: 'default', duration: 60 },
-                          ]}, { label: '激进', rules: [
-                            { match: { status: [429] }, duration: 10 },
-                            { match: { status: [401, 403, 500] }, duration: -1 },
-                            { match: 'default', duration: 30 },
-                          ]}, { label: '宽松', rules: [
-                            { match: { status: [429] }, duration: 60 },
-                            { match: { status: [401, 403] }, duration: -1 },
-                          ]}].map(tpl => (
-                            <button
-                              key={tpl.label}
-                              type="button"
-                              onClick={() => updatePreference('key_rules', tpl.rules)}
-                              className="text-[10px] font-medium px-2 py-1 rounded bg-muted hover:bg-muted/80 text-muted-foreground hover:text-foreground transition-colors"
-                            >
-                              {tpl.label}
-                            </button>
-                          ))}
-                        </div>
-                      </div>
-                      <p className="text-xs text-muted-foreground mb-3">
-                        按顺序匹配，首条命中生效。Key 处理：冷却=暂时停用，永久禁用=需手动恢复。重试：自动=沿用内置逻辑(4xx不重试，5xx/429重试)，换Key=强制用其他Key重试，报错=跳过重试直接返回客户端。
-                      </p>
-
-                      {/* 规则列表 */}
-                      {/* 修改原因：旧版 Key Rules 使用序号列和两行卡片，导致规则区域过高且条件与动作被割裂。 */}
-                      {/* 修改方式：改为桌面端单行、移动端两行的紧凑列表，并用底部分隔线替代卡片背景。 */}
-                      {/* 目的：保留原有编辑、重试三态和 remap 折叠功能，同时减少纵向空间占用。 */}
-                      <div className="space-y-1">
-                        {(formData.preferences.key_rules || []).map((rule: any, idx: number) => {
-                          const rules = formData.preferences.key_rules || [];
-                          const replaceRule = (r: any) => { const n = [...rules]; n[idx] = r; updatePreference('key_rules', n); };
-                          const updateRule = (p: any) => replaceRule({ ...rules[idx], ...p });
-                          const clearField = (f: 'remap' | 'retry') => { const r = { ...rules[idx] }; delete r[f]; replaceRule(r); };
-                          const removeRule = () => updatePreference('key_rules', rules.filter((_: any, i: number) => i !== idx));
-                          const mt = rule.match === 'default' ? 'default' : rule.match?.keyword ? 'keyword' : 'status';
-                          const retryMode = getKeyRuleRetryMode(rule);
-                          const durationMode = rule.duration === -1 ? '-1' : Number(rule.duration) > 0 ? 'cd' : '0';
-                          const controlClass = 'h-6 bg-background border border-border rounded px-1 py-0 text-[11px] leading-none text-foreground';
-                          const inputClass = `${controlClass} font-mono`;
-                          const retryOptions: [KeyRuleRetryMode, string, string][] = [['default', '自动', '沿用内置重试逻辑'], ['force', '换Key', '强制用其他Key重试'], ['disable', '报错', '跳过重试直接返回']];
-                          return (
-                            <div key={idx} className="border-b border-border py-1 text-[11px]">
-                              <div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:gap-1 sm:flex-nowrap">
-                                <div className="flex min-w-0 items-center gap-1 sm:shrink-0">
-                                  <select value={mt} onChange={e => { const v = e.target.value; if (v === 'default') updateRule({ match: 'default' }); else if (v === 'status') updateRule({ match: { status: [429] } }); else updateRule({ match: { keyword: [''] } }); }} className={`${controlClass} w-[64px] sm:w-[66px]`}>
-                                    <option value="status">状态码</option>
-                                    <option value="keyword">关键词</option>
-                                    <option value="default">default</option>
-                                  </select>
-                                  {mt === 'status' && <DeferredInput inputMode="numeric" value={formatKeyRuleStatusInput(rule.match?.status)} onCommit={v => updateRule({ match: { status: parseKeyRuleStatusInput(v) } })} placeholder="429" className={`${inputClass} w-[68px]`} />}
-                                  {mt === 'keyword' && <DeferredInput value={formatKeyRuleKeywordsInput(rule.match?.keyword)} onCommit={v => updateRule({ match: { keyword: parseKeyRuleKeywordsInput(v) } })} placeholder="quota, rate limit" className={`${inputClass} w-[110px] sm:w-[118px]`} />}
-                                  <button type="button" onClick={removeRule} className="ml-auto inline-flex h-6 w-6 items-center justify-center text-red-500/60 hover:text-red-500 sm:hidden" title="删除"><X className="h-3 w-3" /></button>
-                                </div>
-                                <span className="hidden h-5 w-px bg-border sm:block" aria-hidden="true" />
-                                <div className="flex min-w-0 flex-wrap items-center gap-1 sm:flex-1 sm:flex-nowrap">
-                                  <select value={durationMode} onChange={e => { const v = e.target.value; if (v === '-1') updateRule({ duration: -1 }); else if (v === '0') updateRule({ duration: 0 }); else updateRule({ duration: Number(rule.duration) > 0 ? Number(rule.duration) : 60 }); }} className={`${controlClass} w-[72px]`}>
-                                    <option value="cd">冷却</option>
-                                    <option value="-1">永久禁用</option>
-                                    <option value="0">不处理</option>
-                                  </select>
-                                  {Number(rule.duration) > 0 && <><input type="number" min={1} value={rule.duration} onChange={e => updateRule({ duration: Math.max(1, parseInt(e.target.value, 10) || 1) })} className={`${inputClass} w-[46px]`} /><span className="text-[10px] text-muted-foreground">s</span></>}
-                                  <div className="inline-flex h-6 overflow-hidden rounded border border-border" title="重试控制">
-                                    {retryOptions.map(([v, l, tip]) => (
-                                      <button key={v} type="button" title={tip} onClick={() => replaceRule(setKeyRuleRetryMode(rule, v))} className={`px-1.5 text-[10px] leading-none transition-colors ${retryMode === v ? v === 'force' ? 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 font-semibold' : v === 'disable' ? 'bg-red-500/15 text-red-600 dark:text-red-400 font-semibold' : 'bg-muted text-muted-foreground font-semibold' : 'text-muted-foreground hover:bg-muted/50 hover:text-foreground'}`}>{l}</button>
-                                    ))}
-                                  </div>
-                                  {rule.remap != null ? (<span className="inline-flex h-6 items-center gap-0.5"><span className="text-[10px] text-muted-foreground">↔</span><input type="number" min={100} max={599} value={rule.remap} onChange={e => { const raw = e.target.value.trim(); if (!raw) clearField('remap'); else updateRule({ remap: raw }); }} placeholder="码" title="错误码映射" className={`${inputClass} w-[42px]`} /><button type="button" onClick={() => clearField('remap')} className="inline-flex h-6 w-4 items-center justify-center text-[10px] text-muted-foreground hover:text-foreground" title="移除映射">×</button></span>) : (<button type="button" onClick={() => updateRule({ remap: '' })} className="inline-flex h-6 w-6 items-center justify-center rounded border border-transparent text-[11px] text-muted-foreground hover:border-border hover:text-foreground" title="添加错误码映射">↔</button>)}
-                                </div>
-                                <button type="button" onClick={removeRule} className="ml-auto hidden h-6 w-6 shrink-0 items-center justify-center text-red-500/60 hover:text-red-500 sm:inline-flex" title="删除"><X className="h-3 w-3" /></button>
-                              </div>
-                            </div>
-                          );
-                        })}
-                      </div>
-
-                      {/* 添加规则 */}
-                      <button
-                        type="button"
-                        onClick={() => {
-                          const rules = formData.preferences.key_rules || [];
-                          updatePreference('key_rules', [...rules, { match: { status: [429] }, duration: 30 }]);
-                        }}
-                        className="text-xs text-primary hover:text-primary/80 flex items-center gap-1 mt-2"
-                      >
-                        <Plus className="w-3 h-3" /> 添加规则
-                      </button>
-                    </div>
                   </div>
                 </section>}
 
@@ -962,32 +1154,29 @@ export function ChannelEditor({ state }: ChannelEditorProps) {
                     <Settings2 className="w-4 h-4 text-muted-foreground" /> 高级设置
                   </div>
                   <div className="space-y-4">
-                    <div>
-                      <div className="flex items-center justify-between mb-1.5">
-                        <label className="text-sm font-medium text-foreground flex items-center gap-1.5"><Puzzle className="w-3.5 h-3.5 text-emerald-500" /> 拦截器插件</label>
-                        <span className="text-xs text-muted-foreground hidden sm:inline">格式: plugin_name[:config]</span>
-                      </div>
-                      <div className="bg-muted/50 border border-border rounded-lg p-3">
-                        <div className="flex flex-wrap gap-2 mb-3">
-                          {(!formData.preferences.enabled_plugins || formData.preferences.enabled_plugins.length === 0) ? (
-                            <span className="text-sm text-muted-foreground italic">未启用任何插件</span>
-                          ) : (
-                            (formData.preferences.enabled_plugins as string[]).map((p: string, idx: number) => {
-                              const [name, opts] = p.split(':');
-                              return (
-                                <span key={idx} className="bg-emerald-500/10 border border-emerald-500/20 text-emerald-600 dark:text-emerald-500 px-2 py-1 rounded text-xs font-mono flex items-center gap-1">
-                                  <Puzzle className="w-3 h-3" />
-                                  {name} {opts && <span className="opacity-60">({opts})</span>}
-                                </span>
-                              );
-                            })
-                          )}
-                        </div>
-                        <button onClick={() => setShowPluginSheet(true)} className="text-xs bg-muted text-foreground hover:bg-muted/80 px-3 py-1.5 rounded-md flex items-center gap-1.5 transition-colors">
-                          <Settings2 className="w-3 h-3" /> 配置插件 ({formData.preferences.enabled_plugins?.length || 0})
-                        </button>
-                      </div>
-                    </div>
+                    {/* 请求处理流水线 — 可视化 Pipeline */}
+                    <PipelineView
+                      formData={formData}
+                      allPlugins={allPlugins}
+                      overridesJson={overridesJson}
+                      setOverridesJson={setOverridesJson}
+                      headerEntries={headerEntries}
+                      setHeaderEntries={setHeaderEntries}
+                      onOpenPluginSheet={() => setShowPluginSheet(true)}
+                      onPluginsChange={(plugins) => {
+                        // 修改原因：PipelineView 现在支持 inline 增删插件和编辑参数，需要直接写回当前渠道表单。
+                        // 修改方式：仅更新 preferences.enabled_plugins，保留其他 preferences 字段不变。
+                        // 目的：让常用插件操作无需打开 InterceptorSheet，也不影响插件表单的完整配置能力。
+                        setFormData(prev => {
+                          if (!prev) return prev;
+                          return { ...prev, preferences: { ...prev.preferences, enabled_plugins: plugins } };
+                        });
+                      }}
+                      onSystemPromptChange={(v) => updatePreference('system_prompt', v)}
+                      keyRules={formData.preferences.key_rules || []}
+                      onKeyRulesChange={(rules) => updatePreference('key_rules', rules)}
+                      formatJsonOnBlur={formatJsonOnBlur}
+                    />
 
                     <div className="flex gap-3 items-end">
                       <div className="flex-1 min-w-0">
@@ -1033,69 +1222,6 @@ export function ChannelEditor({ state }: ChannelEditorProps) {
                         </div>
                       </div>
                     </div>
-                    <div>
-                      <label className="text-sm font-medium text-foreground mb-1.5 block">系统提示词 (System Prompt)</label>
-                      <textarea value={formData.preferences.system_prompt || ''} onChange={e => updatePreference('system_prompt', e.target.value)} rows={3} className="w-full bg-background border border-border px-3 py-2 rounded-lg text-sm text-foreground" />
-                    </div>
-                    <div>
-                      <label className="text-sm font-medium text-foreground mb-1.5 block">自定义请求头</label>
-                      <div className="space-y-2">
-                        {headerEntries.map((entry, idx) => (
-                          <div key={idx} className="flex gap-2 items-center">
-                            <input
-                              value={entry.key}
-                              onChange={e => {
-                                const next = [...headerEntries];
-                                next[idx] = { ...next[idx], key: e.target.value };
-                                setHeaderEntries(next);
-                              }}
-                              placeholder="Header-Name"
-                              className="flex-1 bg-background border border-border px-3 py-1.5 rounded-lg text-sm font-mono text-foreground"
-                            />
-                            <input
-                              value={entry.value}
-                              onChange={e => {
-                                const next = [...headerEntries];
-                                next[idx] = { ...next[idx], value: e.target.value };
-                                setHeaderEntries(next);
-                              }}
-                              placeholder="Value"
-                              className="flex-1 bg-background border border-border px-3 py-1.5 rounded-lg text-sm font-mono text-foreground"
-                            />
-                            <button onClick={() => setHeaderEntries(headerEntries.filter((_, i) => i !== idx))} className="text-muted-foreground hover:text-destructive transition-colors">
-                              <X className="w-4 h-4" />
-                            </button>
-                          </div>
-                        ))}
-                        <button onClick={() => setHeaderEntries([...headerEntries, { key: '', value: '' }])} className="text-xs text-primary hover:text-primary/80 flex items-center gap-1">
-                          <Plus className="w-3 h-3" /> 添加请求头
-                        </button>
-                      </div>
-                      <p className="text-xs text-muted-foreground mt-1">支持同名 Header，每条单独发送</p>
-                    </div>
-                    <div>
-                      <label className="text-sm font-medium text-foreground mb-1.5 block">请求体覆写 (JSON)</label>
-                      <textarea
-                        value={overridesJson}
-                        onChange={e => setOverridesJson(e.target.value)}
-                        onBlur={() => formatJsonOnBlur(overridesJson, setOverridesJson, '请求体覆写')}
-                        rows={3}
-                        placeholder='{"all": {"temperature": 0.1}}'
-                        className="w-full bg-background border border-border px-3 py-2 rounded-lg text-sm font-mono focus:border-primary outline-none text-foreground"
-                      />
-                      <p className="text-xs text-muted-foreground mt-1">
-                        失焦时自动格式化。key 为 <code className="px-1 py-0.5 bg-muted rounded text-[11px]">all</code> 或 <code className="px-1 py-0.5 bg-muted rounded text-[11px]">*</code> 全局生效，模型名精确匹配。dict 递归合并，数组整体覆写，key 加 <code className="px-1 py-0.5 bg-muted rounded text-[11px]">+</code> 前缀追加数组（如 <code className="px-1 py-0.5 bg-muted rounded text-[11px]">+tools</code>）。值为 <code className="px-1 py-0.5 bg-muted rounded text-[11px]">null</code> 删除该字段。
-                      </p>
-                      {hasUiSlot(formData.engine, 'override_hint', formData.preferences.enabled_plugins) && (
-                        <>
-                          {/* 修改原因：请求体覆写格式可能因渠道协议不同而不同，通用前端不能写死 Antigravity 等渠道的专属提醒。 */}
-                          {/* 修改方式：在请求体覆写说明文字下方提供 override_hint 挂载点，仅当当前 engine 注册该插槽时渲染 UiSlot。 */}
-                          {/* 目的：让渠道自行写入参数覆写提示，未注册时不显示任何额外 DOM 或空白。 */}
-                          <UiSlot engine={formData.engine} slot="override_hint" data={null} element="div" className="text-xs text-amber-600 dark:text-amber-400 mt-1" enabledPlugins={formData.preferences.enabled_plugins || []} />
-                        </>
-                      )}
-                    </div>
-
                     <div className="flex items-center justify-between p-3 bg-muted/50 rounded-lg border border-border">
                       <span className="text-sm text-foreground">启用 Tools (函数调用)</span>
                       <Switch.Root checked={formData.preferences.tools} onCheckedChange={val => updatePreference('tools', val)} className="w-11 h-6 bg-muted rounded-full data-[state=checked]:bg-primary">

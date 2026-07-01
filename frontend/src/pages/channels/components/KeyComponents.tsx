@@ -1,6 +1,7 @@
 import { ClipboardPaste, LogIn, Play, ToggleRight, Trash2 } from 'lucide-react';
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent } from 'react';
 
+import type { EnabledPluginValue } from '../../../lib/pluginEntries';
 import type { ApiKeyObj, BalanceResult } from '../types';
 import {
   buildRoundRectPath,
@@ -121,7 +122,7 @@ export function KeyLabelOverlay({ label, hasTag, isFocused, children }: { label?
   );
 }
 
-export const UiSlot = ({ engine, slot, data, context, className, element = 'span', fallbackText, enabledPlugins }: { engine: string; slot: string; data: any; context?: Record<string, any>; className?: string; element?: 'span' | 'div'; fallbackText?: string; enabledPlugins?: string[] }) => {
+export const UiSlot = ({ engine, slot, data, context, className, element = 'span', fallbackText, enabledPlugins }: { engine: string; slot: string; data: any; context?: Record<string, any>; className?: string; element?: 'span' | 'div'; fallbackText?: string; enabledPlugins?: EnabledPluginValue[] }) => {
   const ref = useRef<HTMLElement | null>(null);
   const [loaded, setLoaded] = useState(false);
   const dataRef = useRef(data);
@@ -210,11 +211,12 @@ export const UiSlot = ({ engine, slot, data, context, className, element = 'span
 };
 
 // ── 冷却中 Key 行组件（SVG 边框进度） ──
-export function CoolingKeyRow({ idx, keyObj, remainSec, totalDuration, focused, onFocus, onBlur, onRecover, onToggle, onTest, onDelete, onLabelChange }: {
+export function CoolingKeyRow({ idx, keyObj, remainSec, totalDuration, focused, onFocus, onBlur, onRecover, onToggle, onTest, onDelete, onLabelChange, alwaysShowRecover }: {
   idx: number; keyObj: { key: string; disabled: boolean; label?: string }; remainSec: number; totalDuration: number;
   focused: boolean;
   onFocus: () => void; onBlur: () => void;
   onRecover: () => void; onToggle: () => void; onTest: () => void; onDelete: () => void; onLabelChange?: (label: string) => void;
+  alwaysShowRecover?: boolean;
 }) {
   const wrapperRef = useRef<HTMLDivElement>(null);
   const [svgViewBox, setSvgViewBox] = useState('');
@@ -283,7 +285,7 @@ export function CoolingKeyRow({ idx, keyObj, remainSec, totalDuration, focused, 
             </span>
           )}
         </div>
-        {!focused && (
+        {(!focused || alwaysShowRecover) && (
           <button onClick={onRecover} className="text-[11px] px-2 py-0.5 rounded border border-emerald-500/50 bg-emerald-500/20 text-emerald-400 font-medium hover:bg-emerald-500/30 hover:border-emerald-400 cursor-pointer flex-shrink-0 relative z-[2] transition-colors">恢复</button>
         )}
         <div className="actions flex items-center gap-1 flex-shrink-0 relative z-[2]">
