@@ -18,24 +18,56 @@ from .utils import generate_sse_response, end_of_line
 async def assemble_stream_to_json(stream_generator):
     """
     收集流式 SSE 响应，拼装成标准 OAI 非流式 JSON 响应。
-    
+
+    重要：本函数会将整个流式响应累积到内存中。为防止长推理（Claude 等模型
+    可产出 64K+ token 的 reasoning_content）导致 OOM，内部设置了硬上限：
+    - 单字段最大累积 4 MiB（约 1M 中文字符），超出后截断并记录日志
+    - 使用 list + join 代替字符串 += 拼接，避免 O(n²) 内存碎片
+
     Args:
         stream_generator: 产出 SSE 字符串或 error dict 的异步生成器
-    
+
     Returns:
         dict: 标准 OpenAI chat.completion 格式的响应
     """
+
+    # 单字段累积上限：4 MiB，约等于 ~1M 个中文字符或 ~4M 个 ASCII 字符
+    _MAX_FIELD_BYTES = 4 * 1024 * 1024
+
+    def _safe_append(accum: list, piece: str, field_name: str) -> bool:
+        """将 piece 加入 accum 列表；返回 True 表示仍在限制内。"""
+        accum.append(piece)
+        total = sum(len(s) for s in accum)
+        if total > _MAX_FIELD_BYTES:
+            logger.warning(
+                f"[stream_convert] {field_name} exceeded {_MAX_FIELD_BYTES} bytes "
+                f"({total} bytes), truncating"
+            )
+            return False
+        return True
+
+    def _join_and_truncate(accum: list, max_bytes: int = _MAX_FIELD_BYTES) -> str:
+        """拼接 accum 并在 max_bytes 处截断。"""
+        joined = "".join(accum)
+        if len(joined) > max_bytes:
+            return joined[:max_bytes]
+        return joined
     msg_id = ""
     msg_model = ""
     created = 0
     role = "assistant"
-    content = ""
-    reasoning_content = ""
+    content_parts: list = []  # list 累积，避免 O(n²) 字符串拼接
+    reasoning_parts: list = []
+    refusal_parts: list = []
     tool_calls_accum = {}  # index → {id, type, function: {name, arguments}}
     finish_reason = None
     prompt_tokens = 0
     completion_tokens = 0
     total_tokens = 0
+    # 各字段是否已超限
+    _content_full = False
+    _reasoning_full = False
+    _refusal_full = False
 
     try:
         async for chunk in stream_generator:
@@ -82,14 +114,15 @@ async def assemble_stream_to_json(stream_generator):
 
                     if delta.get("role"):
                         role = delta["role"]
-                    if "content" in delta and isinstance(delta["content"], str):
-                        content += delta["content"]
-                    if "reasoning_content" in delta and isinstance(delta["reasoning_content"], str):
-                        reasoning_content += delta["reasoning_content"]
-                    if "refusal" in delta and isinstance(delta["refusal"], str):
-                        if "refusal" not in locals() or refusal is None:
-                            refusal = ""
-                        refusal += delta["refusal"]
+                    if "content" in delta and isinstance(delta["content"], str) and not _content_full:
+                        if not _safe_append(content_parts, delta["content"], "content"):
+                            _content_full = True
+                    if "reasoning_content" in delta and isinstance(delta["reasoning_content"], str) and not _reasoning_full:
+                        if not _safe_append(reasoning_parts, delta["reasoning_content"], "reasoning_content"):
+                            _reasoning_full = True
+                    if "refusal" in delta and isinstance(delta["refusal"], str) and not _refusal_full:
+                        if not _safe_append(refusal_parts, delta["refusal"], "refusal"):
+                            _refusal_full = True
 
                     if delta.get("tool_calls"):
                         for tc in delta["tool_calls"]:
@@ -137,8 +170,12 @@ async def assemble_stream_to_json(stream_generator):
             "details": str(e),
         }
 
-    # 组装 message
-    message = {"role": role, "refusal": refusal if 'refusal' in locals() else None}
+    # 组装 message（将累积的 list 拼接为最终字符串）
+    content = _join_and_truncate(content_parts)
+    reasoning_content = _join_and_truncate(reasoning_parts)
+    refusal = _join_and_truncate(refusal_parts) if refusal_parts else None
+
+    message = {"role": role, "refusal": refusal}
     if tool_calls_accum:
         message["content"] = content if content else None
         message["tool_calls"] = [tool_calls_accum[i] for i in sorted(tool_calls_accum.keys())]

@@ -5,7 +5,13 @@ FROM node:20-slim AS frontend_builder
 WORKDIR /app/frontend
 
 COPY frontend/package.json frontend/package-lock.json ./
-RUN npm ci
+# 使用国内 npm 镜像源，避免国外 registry 网络中断（ECONNRESET）
+# 同时放宽超时与重试，缓解偶发网络抖动
+RUN npm ci --registry=https://registry.npmmirror.com \
+    --fetch-timeout=600000 \
+    --fetch-retries=5 \
+    --fetch-retry-mintimeout=20000 \
+    --fetch-retry-maxtimeout=120000
 COPY frontend/ ./
 RUN npm run build
 
