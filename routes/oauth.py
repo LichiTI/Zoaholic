@@ -328,7 +328,20 @@ def _normalize_batch_import_data(data) -> list[dict]:
     if isinstance(data, dict) and isinstance(data.get("accounts"), list):
         return [_normalize_sub2api_account(account) for account in data.get("accounts", [])]
     if isinstance(data, list):
-        return [_normalize_cpa_import_item(item) for item in data]
+        # 修改原因：用户需要批量粘贴纯 refresh_token 列表（一行一个），data 是 ["rt1", "rt2", ...] 字符串数组。
+        # 修改方式：列表元素为字符串时包装为最小凭据结构，由后续 refresh 逻辑获取 access_token 和 email。
+        # 目的：复用现有 batch_import 链路，不新增端点。
+        results = []
+        for item in data:
+            if isinstance(item, str) and item.strip():
+                results.append({
+                    "key_id": f"token_{len(results) + 1}",
+                    "token_data": {"refresh_token": item.strip()},
+                    "source_format": "refresh_token",
+                })
+            else:
+                results.append(_normalize_cpa_import_item(item))
+        return results
     if isinstance(data, dict) and "access_token" in data:
         return [_normalize_cpa_import_item(data)]
     if isinstance(data, dict):
@@ -426,6 +439,63 @@ async def _sync_provider_api_key_rename(app, channel_id: str, old_key_id: str, n
             replaced, changed = _replace_api_key_id_entry(api_value, old_key_id, new_key_id)
             if changed:
                 provider["api"] = replaced
+        break
+
+    if not changed:
+        return False
+
+    from routes.admin import _persist_config
+
+    await _persist_config(app, sections_to_verify=["providers"], changed_providers={channel_id})
+    return True
+
+
+async def _sync_provider_api_key_add(app, channel_id: str, key_id: str) -> bool:
+    """OAuth 导入成功后，把新 key_id 追加到当前 provider 的 api 列表并持久化。
+
+    修改原因：渠道 Key 列表以 api.yaml 中 provider.api 为索引，OAuth 导入只写 oauth_state.json，
+    导致新账号不出现在渠道 Key 列表中，也不参与请求调度。
+    修改方式：定位 engine/provider 匹配的 provider，把新 key_id 追加到 api 列表末尾（已存在则跳过），
+    复用 _persist_config 写回配置并热更新运行时。
+    目的：导入后立即可见可用，无需管理员手工编辑渠道。
+    """
+    if not key_id:
+        return False
+    config = getattr(getattr(app, "state", None), "config", None)
+    if not isinstance(config, dict):
+        return False
+    providers = config.get("providers")
+    if not isinstance(providers, list):
+        return False
+
+    changed = False
+    for provider in providers:
+        if not isinstance(provider, dict):
+            continue
+        provider_name = str(provider.get("provider") or provider.get("name") or "").strip()
+        provider_engine = str(provider.get("engine") or "").strip()
+        if provider_name != channel_id and provider_engine != channel_id:
+            continue
+
+        api_value = provider.get("api")
+        if isinstance(api_value, list):
+            existing = set()
+            for item in api_value:
+                if isinstance(item, dict) and len(item) == 1:
+                    raw_key = str(next(iter(item.keys()))).strip().lstrip("!")
+                    existing.add(raw_key)
+                elif isinstance(item, str):
+                    existing.add(item.strip().lstrip("!"))
+            if key_id not in existing:
+                api_value.append(key_id)
+                changed = True
+        elif isinstance(api_value, str):
+            if api_value.strip().lstrip("!") != key_id:
+                provider["api"] = [api_value, key_id] if api_value.strip() else [key_id]
+                changed = True
+        elif api_value is None:
+            provider["api"] = [key_id]
+            changed = True
         break
 
     if not changed:
@@ -693,10 +763,14 @@ async def import_account(request: Request):
             final_key_id = email if email else key_id
             already_exists = _key_exists_in_provider(request.app, channel_id, final_key_id)
             await oauth_mgr.register(channel_id, final_key_id, type_name, updated)
+            if not already_exists:
+                await _sync_provider_api_key_add(request.app, channel_id, final_key_id)
             return {"message": "Account imported", "key_id": final_key_id, "already_exists": already_exists}
         else:
             already_exists = _key_exists_in_provider(request.app, channel_id, key_id)
             await oauth_mgr.register(channel_id, key_id, type_name, token_data)
+            if not already_exists:
+                await _sync_provider_api_key_add(request.app, channel_id, key_id)
             return {"message": "Account imported", "key_id": key_id, "already_exists": already_exists}
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=400)
@@ -767,6 +841,8 @@ async def batch_import(request: Request):
             final_key_id = email or key_id
             already_exists = _key_exists_in_provider(request.app, channel_id, final_key_id)
             await oauth_mgr.register(channel_id, final_key_id, type_name, token_data)
+            if not already_exists:
+                await _sync_provider_api_key_add(request.app, channel_id, final_key_id)
             success += 1
             results.append({"key_id": final_key_id, "status": "success", "already_exists": already_exists})
         except Exception as exc:

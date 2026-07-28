@@ -759,6 +759,7 @@ async def lifespan(app: FastAPI):
         # 修改方式：启动时扫描 registry 中所有声明了 oauth_provider 的渠道，并统一注册到 OAuthManager。
         # 目的：消除 Codex、Claude Code、Gemini CLI 等渠道硬编码，让内置渠道和插件渠道共享注册路径。
         _register_oauth_providers_from_registry(app.state.oauth_manager)
+        app.state.oauth_manager.start_proactive_refresh()
 
 
     if app and not hasattr(app.state, "channel_manager"):
@@ -975,6 +976,12 @@ app = FastAPI(lifespan=lifespan, debug=is_debug)
 app.include_router(api_router)
 app.include_router(oauth_router)
 
+# 修改原因：客户端（如新版 Codex CLI）需要直连 Zoaholic 的 Responses WebSocket mode。
+# 修改方式：注册 /v1/responses 的 WS 端点，协议与 OpenAI 官方一致，内部复用 handler 调度与统计链路。
+# 目的：提供客户端→网关→上游的完整 WS 透传路径，与 HTTP 入口并存互不影响。
+from core.dialects.openai_responses_ws import register_ws_endpoint
+register_ws_endpoint(app)
+
 
 def generate_markdown_docs():
     openapi_schema = app.openapi()
@@ -1149,7 +1156,10 @@ if __name__ == '__main__':
         "port": PORT,
         "proxy_headers": True,
         "forwarded_allow_ips": "*",
-        "ws": "none",
+        # 修改原因：/v1/responses 新增 WebSocket 透传端点，原配置 ws="none" 会让 WS 握手落到 SPA fallback 返回 HTML。
+        # 修改方式：启用 websockets 实现（依赖已存在）。
+        # 目的：让客户端 WS 连接正常完成 101 升级。
+        "ws": "websockets",
         # "log_level": "warning"
     }
     
