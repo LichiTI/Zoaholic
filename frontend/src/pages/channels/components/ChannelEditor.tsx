@@ -14,6 +14,7 @@ import { ProviderLogo } from '../../../components/ProviderLogos';
 import { PipelineView } from './PipelineView';
 import { summarizeVirtualChain } from '../../../lib/virtualModels';
 import { apiFetch } from '../../../lib/api';
+import { createApiKeyClientId } from '../../../lib/apiKeyClientId';
 import { toastError, fmtErr } from '../../../components/Toast';
 import type { ChannelOption } from '../types';
 import { SCHEDULE_ALGORITHMS, getBalancePercent, hasUiSlot } from '../utils';
@@ -363,7 +364,7 @@ export function ChannelEditor({ state }: ChannelEditorProps) {
                         {formData.api_keys.map((keyObj, idx) => {
                           if (focusedKeyIdx === idx) {
                             return (
-                              <div key={`full-${idx}`} className="w-full basis-full">
+                              <div key={`full-${keyObj._clientId}`} style={{ gridColumn: '1 / -1' }}>
                                 {/* 修改原因：机房模式中被选中的卡片需要展开为原完整行，才能编辑完整 Key、备注和全部操作。
                                     修改方式：在 flex-wrap 网格中用 w-full basis-full 包裹共用完整行渲染，让展开项独占一整行。
                                     目的：其他未选中卡片继续保持紧凑排列，选中项上下自然换行。 */}
@@ -398,7 +399,7 @@ export function ChannelEditor({ state }: ChannelEditorProps) {
 
                           return (
                             <RackCard
-                              key={idx}
+                              key={keyObj._clientId}
                               idx={idx}
                               keyObj={keyObj}
                               providerName={formData.provider}
@@ -417,7 +418,6 @@ export function ChannelEditor({ state }: ChannelEditorProps) {
                         })}
                         <div
                           className="relative h-[92px] overflow-hidden rounded-lg border border-dashed border-border/60 bg-card/50 text-foreground transition-all duration-200 hover:border-primary/40 flex flex-col items-center justify-center gap-1.5"
-                          style={{ width: 'calc((100% - 5 * 6px) / 6)' }}
                         >
                           <button type="button" onClick={addEmptyKey} className="flex items-center gap-1 rounded px-2 py-1 text-[10px] text-primary hover:bg-muted"><Plus className="w-3 h-3" /> 添加</button>
                           {isOAuthEngine ? (
@@ -431,7 +431,7 @@ export function ChannelEditor({ state }: ChannelEditorProps) {
                       <>
                         {formData.api_keys.map((keyObj, idx) => (
                           <FullKeyRow
-                            key={idx}
+                            key={keyObj._clientId}
                             keyObj={keyObj}
                             idx={idx}
                             formData={formData}
@@ -478,7 +478,7 @@ export function ChannelEditor({ state }: ChannelEditorProps) {
                           ) : (
                             <button type="button" onClick={() => { setBatchPasteOpen(true); setBatchImportOpen(false); }} className="text-muted-foreground hover:text-primary flex items-center gap-1"><ClipboardPaste className="w-3.5 h-3.5" /> 批量粘贴</button>
                           )}
-                          <button type="button" onClick={() => setFormData(prev => prev ? ({...prev, api_keys: [...prev.api_keys, {key: '*', disabled: false}]}) : prev)} className="text-muted-foreground hover:text-foreground flex items-center gap-1">* BYOK</button>
+                          <button type="button" onClick={() => setFormData(prev => prev ? ({...prev, api_keys: [...prev.api_keys, {_clientId: createApiKeyClientId(), key: '*', disabled: false}]}) : prev)} className="text-muted-foreground hover:text-foreground flex items-center gap-1">* BYOK</button>
                         </div>
                       </div>
                     )}
@@ -636,8 +636,52 @@ export function ChannelEditor({ state }: ChannelEditorProps) {
                                 headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
                                 body: JSON.stringify({ provider: formData.provider, type: formData.engine, data }),
                               });
-                              const json = await res.json();
-                              if (!res.ok) { setBatchImportError(json?.error || '导入失败'); } else { setBatchImportResult(json); refreshOAuthAccounts?.(); }
+                              if (!res.ok) {
+                                const json = await res.json().catch(() => null);
+                                setBatchImportError(json?.error || '导入失败');
+                              } else if (!res.body) {
+                                setBatchImportError('当前浏览器不支持流式读取');
+                              } else {
+                                // 后端 NDJSON 流式返回：逐行解析 progress/item/summary 事件，实时更新结果列表
+                                const agg = { total: 0, success: 0, failed: 0, skipped: 0, results: [] as any[] };
+                                const rows: any[] = [];
+                                let buf = '';
+                                let sawSummary = false;
+                                const reader = res.body.getReader();
+                                const decoder = new TextDecoder();
+                                for (;;) {
+                                  const { done, value } = await reader.read();
+                                  if (done) break;
+                                  buf += decoder.decode(value, { stream: true });
+                                  let nl: number;
+                                  while ((nl = buf.indexOf('\n')) >= 0) {
+                                    const line = buf.slice(0, nl).trim();
+                                    buf = buf.slice(nl + 1);
+                                    if (!line) continue;
+                                    let ev: any;
+                                    try { ev = JSON.parse(line); } catch { continue; }
+                                    if (ev.type === 'item') {
+                                      agg.total = ev.total ?? agg.total;
+                                      if (ev.status === 'success') { agg.success++; rows.push({ key_id: ev.key_id, status: ev.status, already_exists: ev.already_exists }); }
+                                      else if (ev.status === 'failed') { agg.failed++; rows.push({ key_id: ev.key_id, status: ev.status, error: ev.error }); }
+                                      else { agg.skipped++; rows.push({ key_id: ev.key_id, status: ev.status, error: ev.error }); }
+                                      setBatchImportResult({ ...agg, results: [...rows] });
+                                    } else if (ev.type === 'progress') {
+                                      agg.total = ev.total ?? agg.total;
+                                      setBatchImportResult({ ...agg, results: [...rows] });
+                                    } else if (ev.type === 'summary') {
+                                      sawSummary = true;
+                                      agg.total = ev.total ?? agg.total;
+                                      agg.success = ev.success; agg.failed = ev.failed; agg.skipped = ev.skipped;
+                                      setBatchImportResult({ ...agg, results: [...rows] });
+                                    } else if (ev.type === 'error') {
+                                      setBatchImportError(ev.error || '导入中断');
+                                    }
+                                  }
+                                }
+                                if (!sawSummary) setBatchImportError('导入中断：连接提前结束');
+                                refreshOAuthAccounts?.({ syncFormKeys: true });
+                              }
                             } catch (err: any) { setBatchImportError(err.message || '请求失败'); }
                             setBatchImportLoading(false);
                           }}
@@ -646,6 +690,7 @@ export function ChannelEditor({ state }: ChannelEditorProps) {
                       </div>
                       {batchImportResult && (
                         <div className="space-y-2">
+                          {batchImportLoading && <p className="text-xs text-muted-foreground">进度：{batchImportResult.results?.length ?? 0} / {batchImportResult.total}</p>}
                           <p className="text-xs font-medium">结果：✅ {batchImportResult.success} 成功 {batchImportResult.failed > 0 ? `❌ ${batchImportResult.failed} 失败` : ''} {batchImportResult.skipped > 0 ? `⚠️ ${batchImportResult.skipped} 跳过` : ''}</p>
                           <div className="max-h-40 overflow-y-auto text-xs space-y-1">
                             {batchImportResult.results?.map((r: any, i: number) => (
@@ -718,7 +763,7 @@ export function ChannelEditor({ state }: ChannelEditorProps) {
                               onClick={() => {
                                 setFormData(prev => prev ? ({
                                   ...prev,
-                                  api_keys: [...prev.api_keys, ...newKeys.map(k => ({ key: k, disabled: false }))],
+                                  api_keys: [...prev.api_keys, ...newKeys.map(k => ({ _clientId: createApiKeyClientId(), key: k, disabled: false }))],
                                 }) : prev);
                                 setBatchPasteOpen(false); setBatchPasteText('');
                               }}
@@ -732,10 +777,14 @@ export function ChannelEditor({ state }: ChannelEditorProps) {
                   )}
 
                   {isOAuthEngine && (
-                    <div className="mt-2 flex justify-end">
-                      {/* 修改原因：OAuth 凭据需要一个管理员显式导出入口，用于迁移或备份当前渠道。 */}
-                      {/* 修改方式：在 OAuth Key 列表底部增加小按钮，点击后下载 /v1/oauth/export 返回的 JSON。 */}
-                      {/* 目的：避免在普通账号列表中暴露 refresh_token，同时保留受控导出能力。 */}
+                    <div className="mt-2 flex justify-end gap-3">
+                      <button
+                        type="button"
+                        onClick={() => refreshOAuthAccounts?.({ syncFormKeys: true })}
+                        className="text-xs text-blue-600 dark:text-blue-400 hover:text-blue-700 dark:hover:text-blue-300 flex items-center gap-1"
+                      >
+                        <RefreshCw className="w-3 h-3" /> 同步 OAuth 账号
+                      </button>
                       <button
                         type="button"
                         onClick={exportOAuthCredentials}
@@ -1259,11 +1308,21 @@ export function ChannelEditor({ state }: ChannelEditorProps) {
                         修改方式：按渠道注册声明的 preference_toggles 元数据动态渲染，写入 provider.preferences[toggle.key]。
                         目的：后端渠道声明开关即自动出现（如 openai-responses/codex 的 WebSocket 传输），无需改前端。 */}
                     {(channelTypes.find(c => c.id === formData.engine)?.preference_toggles || []).map(toggle => (
-                      <div key={toggle.key} className="flex items-center justify-between p-3 bg-muted/50 rounded-lg border border-border">
-                        <span className="text-sm text-foreground" title={toggle.tip || ''}>{toggle.label}</span>
-                        <Switch.Root checked={!!formData.preferences[toggle.key]} onCheckedChange={val => updatePreference(toggle.key, val)} className="w-11 h-6 bg-muted rounded-full data-[state=checked]:bg-primary">
-                          <Switch.Thumb className="block w-5 h-5 bg-white rounded-full transition-transform data-[state=checked]:translate-x-[22px]" />
-                        </Switch.Root>
+                      <div key={toggle.key} className="flex items-center justify-between gap-3 p-3 bg-muted/50 rounded-lg border border-border">
+                        <span className="text-sm text-foreground shrink-0" title={toggle.tip || ''}>{toggle.label}</span>
+                        {toggle.type === 'text' ? (
+                          <input
+                            type="text"
+                            value={formData.preferences[toggle.key] ?? ''}
+                            placeholder={toggle.placeholder || ''}
+                            onChange={e => updatePreference(toggle.key, e.target.value)}
+                            className="w-40 shrink-0 rounded-md border border-border bg-background px-2 py-1 text-sm font-mono text-foreground focus:outline-none focus:ring-1 focus:ring-primary"
+                          />
+                        ) : (
+                          <Switch.Root checked={!!formData.preferences[toggle.key]} onCheckedChange={val => updatePreference(toggle.key, val)} className="w-11 h-6 bg-muted rounded-full data-[state=checked]:bg-primary">
+                            <Switch.Thumb className="block w-5 h-5 bg-white rounded-full transition-transform data-[state=checked]:translate-x-[22px]" />
+                          </Switch.Root>
+                        )}
                       </div>
                     ))}
 
@@ -1440,9 +1499,9 @@ export function ChannelEditor({ state }: ChannelEditorProps) {
                                 <div>
                                   <label className="text-xs font-medium text-muted-foreground mb-1 block">值类型</label>
                                   <select
-                                    value={bal.mapping?.value_type === "'percent'" ? 'percent' : bal.mapping?.value_type === "'quota'" ? 'quota' : 'amount'}
+                                    value={bal.mapping?.value_type === "'percent'" ? 'percent' : bal.mapping?.value_type === "'quota'" ? 'quota' : bal.mapping?.value_type === "'plan'" ? 'plan' : 'amount'}
                                     onChange={e => {
-                                      const vtMap: Record<string, string> = { percent: "'percent'", quota: "'quota'", amount: "'amount'" };
+                                      const vtMap: Record<string, string> = { percent: "'percent'", quota: "'quota'", plan: "'plan'", amount: "'amount'" };
                                       const vt = vtMap[e.target.value] || "'amount'";
                                       updatePreference('balance', { ...bal, mapping: { ...(bal.mapping || {}), value_type: vt } });
                                     }}
@@ -1451,6 +1510,7 @@ export function ChannelEditor({ state }: ChannelEditorProps) {
                                     <option value="amount">数额（total / used / available）</option>
                                     <option value="percent">百分比（percent）</option>
                                     <option value="quota">纯额度（以 100 为基准显示颜色）</option>
+                                    <option value="plan">套餐（5h / 7d 双环 + 等级）</option>
                                   </select>
                                 </div>
                                 <div>
@@ -1461,6 +1521,12 @@ export function ChannelEditor({ state }: ChannelEditorProps) {
                                     ] : bal.mapping?.value_type === "'quota'" ? [
                                       { key: 'available', label: 'available', placeholder: 'balance_infos.0.total_balance' },
                                       { key: 'currency', label: 'currency (可选)', placeholder: 'balance_infos.0.currency' },
+                                    ] : bal.mapping?.value_type === "'plan'" ? [
+                                      { key: 'quota_inner', label: '5h 窗口', placeholder: 'eval:limits.0.detail.remaining/limits.0.detail.limit*100' },
+                                      { key: 'quota_outer', label: '7d 配额', placeholder: 'eval:usage.remaining/usage.limit*100' },
+                                      { key: 'level', label: '等级 (可选)', placeholder: 'user.membership.level' },
+                                      { key: 'total', label: 'total (可选)', placeholder: 'usage.limit' },
+                                      { key: 'used', label: 'used (可选)', placeholder: 'usage.used' },
                                     ] : [
                                       { key: 'total', label: 'total', placeholder: 'data.totalQuota' },
                                       { key: 'used', label: 'used', placeholder: 'data.usedQuota' },
